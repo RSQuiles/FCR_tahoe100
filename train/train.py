@@ -156,18 +156,18 @@ def train(args, prepare=prepare, state_dict=None):
         # print("Adversarial Training {}".format(adv_training))
         
         for data in datasets["loader_tr"]:
-            (expriments, treatment, control, _, covariates)= \
+            (experiment, treatment, control, _, covariates)= \
             (data[0], data[1], data[2], data[3], data[4:])
           
             # training without divergence
             minibatch_training_stats = model.update(
-                expriments, treatment, control, covariates, adv_training
+                experiment, treatment, control, covariates, adv_training
             )
             
             
             ## training with divergence
             # minibatch_training_stats = model.update_divergence(
-            #     expriments, treatment, control, covariates, adv_training)
+            #     experiment, treatment, control, covariates, adv_training)
 
             for key, val in minibatch_training_stats.items():
                 epoch_training_stats[key] += val
@@ -188,6 +188,7 @@ def train(args, prepare=prepare, state_dict=None):
         # patience ran out OR max epochs reached
         stop = (epoch == args["max_epochs"] - 1)
 
+        ## NOTE: can we use evaluate and evaluate prediction alternatively?
         if (epoch % args["checkpoint_freq"]) == 0 or stop:
             evaluation_stats = evaluate_prediction(model, datasets)
             for key, val in evaluation_stats.items():

@@ -205,7 +205,7 @@ class FCR(nn.Module):
         self.encoder_ZXT = self.init_encoder_XT()
 
         
-        
+        ## modified: uncommented control encoder, control_prior and their respective parameters
         # self.control_encoder = self.init_encoder_control()
         params.extend(list(self.encoder_ZX.parameters()))
         params.extend(list(self.encoder_ZT.parameters()))
@@ -223,6 +223,8 @@ class FCR(nn.Module):
         # params.extend(list(self.control_prior.parameters()))
 
         ## eval models
+        ## modified: added self.exp_encoder_eval, commented out control_encoder_eval and control_prior_eval
+        self.exp_encoder_eval = copy.deepcopy(self.exp_encoder)
         self.encoder_ZX_eval = copy.deepcopy(self.encoder_ZX)
         self.encoder_ZT_eval = copy.deepcopy(self.encoder_ZT)
         self.encoder_ZXT_eval = copy.deepcopy(self.encoder_ZXT)
@@ -730,7 +732,7 @@ class FCR(nn.Module):
         self,
         outcomes,
         treatments,
-        cf_treatments,
+        #cf_treatments, ## modified: cf_treatments are not used in the function
         covariates,
         return_dist=False
     ):
@@ -747,8 +749,19 @@ class FCR(nn.Module):
             ZT_dist = self.distributionize(
                 ZT_constr, dim=self.hparams["ZT_dim"], dist="normal"
             )
-            
-            outcomes_constr = self.sample_expr(ZX_dist.mean, ZX_dist.stddev,ZT_dist.mean, ZT_dist.stddev)
+
+            ## modified: added ZXT
+            ZXT_constr = self.encode_ZXT(outcomes, covariates, treatments)
+            ZXT_dist = self.distributionize(
+                ZXT_constr, dim=self.hparams["ZXT_dim"], dist="normal"
+            )
+
+            ## modified: sample_expr needs one tensor for the mean, one tensor for the stddev
+            ##           and applies a decoder with input dimension latent_exp_dim
+            latents_dist_mean = torch.cat([ZX_dist.mean, ZXT_dist.mean, ZT_dist.mean], dim = 1)
+            latents_dist_stddev = torch.cat([ZX_dist.stddev, ZXT_dist.stddev, ZT_dist.stddev], dim = 1)
+            #latents_dist = self.distributionize(torch.stack([latents_dist_mean, latents_dist_stddev], dim=-1))
+            outcomes_constr = self.sample_expr(latents_dist_mean, latents_dist_stddev)
             outcomes_dist = self.distributionize(outcomes_constr)
  
 
@@ -952,7 +965,9 @@ class FCR(nn.Module):
         conditions = torch.cat((treatments, covariates), dim=1)
         conditions_labels = torch.unique(conditions, dim=0)
         marginal_ZX_prior =  marginalize_latent_tx(ZX_prior_dist.mean, ZX_prior_dist.stddev, conditions)
-        marginal_ZX = marginalize_latent_tx(ZX_dist[0], ZX_dist[1], conditions)
+        ## modified: index as ZX_dist[...,0/1] to get last dimension, instead of ZX_dist[0/1]
+        #print("ZX_dist: ", ZX_dist.shape)
+        marginal_ZX = marginalize_latent_tx(ZX_dist[...,0], ZX_dist[...,1], conditions)
         kl_divergence_X = torch.tensor(0, dtype=torch.float64, device="cuda")
         # print("marginal_ZX_prior device {}, ZX device {}".format(marginal_ZX_prior.device(), marginal_ZX.device()))
         for i in range(conditions_labels.shape[0]):
@@ -966,7 +981,8 @@ class FCR(nn.Module):
       
         ## ZT divergence
         marginal_ZT_prior =  marginalize_latent_tx(ZT_prior_dist.mean, ZT_prior_dist.stddev, conditions)
-        marginal_ZT = marginalize_latent_tx(ZT_dist[0], ZT_dist[1], conditions)
+        ## modified: index as ZX_dist[...,0/1] to get last dimension, instead of ZX_dist[0/1]
+        marginal_ZT = marginalize_latent_tx(ZT_dist[...,0], ZT_dist[...,1], conditions)
         kl_divergence_T = torch.tensor(0, dtype=torch.float64, device="cuda")
         for i in range(conditions_labels.shape[0]):
             kl_divergence_T +=kldiv_normal(
@@ -979,7 +995,8 @@ class FCR(nn.Module):
         ### Z_XT divergence
     
         marginal_ZXT_prior =  marginalize_latent_tx(ZXT_prior_dist.mean, ZXT_prior_dist.stddev, conditions)
-        marginal_ZXT = marginalize_latent_tx(ZXT_dist[0], ZXT_dist[1], conditions)
+        ## modified: index as ZX_dist[...,0/1] to get last dimension, instead of ZX_dist[0/1]
+        marginal_ZXT = marginalize_latent_tx(ZXT_dist[...,0], ZXT_dist[...,1], conditions)
         kl_divergence_XT = torch.tensor(0,dtype=torch.float64, device="cuda")
         for i in range(conditions_labels.shape[0]):
             kl_divergence_XT +=kldiv_normal(
@@ -1023,7 +1040,7 @@ class FCR(nn.Module):
         
         ZXT_control_constr = self.encode_ZXT(control_outcomes, covariates, control_treatment)
         ZXT_control_dist = self.distributionize(
-            ZXT_control_constr, dim=self.hparams["ZT_dim"], dist="normal"
+            ZXT_control_constr, dim=self.hparams["ZXT_dim"], dist="normal"
         )
         
         ## estimation latents for experiments
@@ -1042,7 +1059,7 @@ class FCR(nn.Module):
         
         ZXT_constr = self.encode_ZXT(outcomes, covariates, treatments)
         ZXT_dist = self.distributionize(
-            ZXT_constr, dim=self.hparams["ZT_dim"], dist="normal"
+            ZXT_constr, dim=self.hparams["ZXT_dim"], dist="normal"
         )
         
         
@@ -1088,7 +1105,7 @@ class FCR(nn.Module):
         #print(ZX_constr[...,0].shape)
         #print(ZX_constr[...,1].shape)
         cov_inputs = ZX_resample
-        print("cov_inputs shape:", cov_inputs.shape)
+        #print("cov_inputs shape:", cov_inputs.shape)
         cov_constr = self.covariate_decode(cov_inputs)
 
         
@@ -1101,16 +1118,20 @@ class FCR(nn.Module):
         ZTs_control = torch.cat([ZT_control_resample, ZXT_control_resample], dim=1)
         treatment_constr = self.intervention_decode(ZTs, ZTs_control)
 
-        control_latents_dist_mean = torch.cat([ZT_control_dist.mean, ZXT_control_dist.mean, ZT_control_dist.mean], dim=1)
-        control_latents_dist_stddev = torch.cat([ZT_control_dist.stddev, ZXT_control_dist.stddev, ZT_control_dist.stddev], dim=1)
-        control_latents_dist = self.distributionize(control_latents_dist_mean, control_latents_dist_stddev)
+        ## modified: had ZT_control_dist and ZT_control_stddev twice when concatenating the latents
+        control_latents_dist_mean = torch.cat([ZX_control_dist.mean, ZXT_control_dist.mean, ZT_control_dist.mean], dim=1)
+        control_latents_dist_stddev = torch.cat([ZX_control_dist.stddev, ZXT_control_dist.stddev, ZT_control_dist.stddev], dim=1)
+        ## modified: stack means and stddev along last dimension to generate distribution object with .mean and .stddev [batch_size x dimensions]
+        control_latents_dist = self.distributionize(torch.stack([control_latents_dist_mean, control_latents_dist_stddev], dim=-1))
         control_outcomes_constr_samp = self.sample_expr(control_latents_dist_mean, control_latents_dist_stddev, size=self.mc_sample_size
         )
         control_outcomes_dist_samp = self.distributionize(control_outcomes_constr_samp)
 
         exp_latents_dist_mean = torch.cat([ZX_dist.mean, ZXT_dist.mean, ZT_dist.mean], dim=1)
         exp_latents_dist_stddev = torch.cat([ZX_dist.stddev, ZXT_dist.stddev, ZT_dist.stddev], dim=1)
-        exp_dist = self.distributionize(exp_latents_dist_mean, exp_latents_dist_stddev)
+        ## modified: stack means and stddev along last dimension to generate distribution object with .mean and .stddev [batch_size x dimensions]
+        exp_dist = self.distributionize(torch.stack([exp_latents_dist_mean, exp_latents_dist_stddev], dim=-1))
+        # print("exp_dist.mean, exp_dist.stddev: ", exp_dist.mean.shape, exp_dist.stddev.shape)
         
         expr_outcomes_constr_samp = self.sample_expr(exp_latents_dist_mean, exp_latents_dist_stddev, size=self.mc_sample_size)
         expr_outcomes_dist_samp = self.distributionize(expr_outcomes_constr_samp)
@@ -1121,12 +1142,12 @@ class FCR(nn.Module):
         return results
 
     
-    def update(self, expr_outcomes, treatments, contol_outcomes, covariates, adv_training=False):
+    def update(self, expr_outcomes, treatments, control_outcomes, covariates, adv_training=False):
         """
         Update model's parameters given a minibatch of outcomes, treatments, and covariates.
         """
         expr_outcomes, treatments, control_outcomes, covariates = self.move_inputs(
-            expr_outcomes, treatments, contol_outcomes, covariates
+            expr_outcomes, treatments, control_outcomes, covariates
         )
         
         if not adv_training: 

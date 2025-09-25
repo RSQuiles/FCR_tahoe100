@@ -24,7 +24,7 @@ def logprob_normal(x, loc, scale, weight=None, eps=1e-8):
 
 def kldiv_normal(mu1: torch.Tensor, sigma1: torch.Tensor,
         mu2: torch.Tensor, sigma2: torch.Tensor) -> torch.Tensor:
-    print("SHAPES: mu1, sigma1, mu2, sigma2 --> ", mu1.shape, sigma1.shape, mu2.shape, sigma2.shape) 
+    #print("SHAPES: mu1, sigma1, mu2, sigma2 --> ", mu1.shape, sigma1.shape, mu2.shape, sigma2.shape) 
     logvar1 = 2 * sigma1.log()
     logvar2 = 2 * sigma2.log()
     return torch.mean(-0.5 * torch.sum(1. + logvar1-logvar2 
