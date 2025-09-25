@@ -74,7 +74,7 @@ class FCR(nn.Module):
         dist_mode="match",
         dist_outcomes="normal",
         type_treatments=None,
-        type_covariates=None,
+        type_covariates="str", # If None, "object", "bool" or "category", embedding is done with Compound Embedding, else, with MLP
         mc_sample_size=30,
         best_score=-1e3,
         patience=5,
@@ -551,6 +551,7 @@ class FCR(nn.Module):
         elif dist == "normal":
             locs = constructions[..., 0]
             scales = F.softplus(constructions[..., 1]).add(eps)
+            scales 
             dist = Normal(
                 loc=locs, scale=scales
             )

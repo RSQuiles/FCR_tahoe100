@@ -152,7 +152,7 @@ class Dataset:
                 names = np.unique(values)
                 self.num_covariates.append(len(names))
 
-                names_idx = torch.arange(len(names)).unsqueeze(-1)
+                names_idx = torch.arange(len(names), dtype=torch.float32).unsqueeze(-1)
                 self.covars_dict[cov] = dict(
                     zip(list(names), names_idx)
                 )
@@ -191,6 +191,8 @@ class Dataset:
             for i in range(len(data))
         ])
 
+        ## modified: commented out if de_genes not used downstream
+        """
         if not ("rank_genes_groups_cov" in data.uns):
             data.obs["cov_name"] = self.cov_names
             data.obs["cov_pert_name"] = self.cov_pert
@@ -200,6 +202,7 @@ class Dataset:
                 reference="cov_name",
                 control_key=control_key)
         self.de_genes = data.uns["rank_genes_groups_cov"]
+        """
 
     def get_unique_perts(self, all_perts=None):
         if all_perts is None:
@@ -250,7 +253,8 @@ class SubDataset:
         # self.cov_control = indx(dataset.cov_control, indices)
 
         self.var_names = dataset.var_names
-        self.de_genes = dataset.de_genes
+        ## modified: commented out if de_genes not used downstream
+        #self.de_genes = dataset.de_genes
 
         self.num_covariates = dataset.num_covariates
         self.num_outcomes = dataset.num_outcomes
@@ -329,7 +333,8 @@ class SubDataset_Pair:
         self.control_vals = '1'
         
         self.var_names = dataset.var_names
-        self.de_genes = dataset.de_genes
+        ## modified: commented out if de_genes not used downstream
+        #self.de_genes = dataset.de_genes
 
         self.num_covariates = dataset.num_covariates
         self.num_outcomes = dataset.num_outcomes

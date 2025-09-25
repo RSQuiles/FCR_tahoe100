@@ -48,7 +48,9 @@ def load_FCR(args, state_dict=None):
         patience=args["patience"],
         device=device,
         distance=args['distance'],
-        hparams=args["hparams"]
+        hparams=args["hparams"],
+        ## modified: added batch size
+        batch_size=args["batch_size"]
     )
     if state_dict is not None:
         model.load_state_dict(state_dict)
@@ -74,13 +76,14 @@ class FCR(nn.Module):
         dist_mode="match",
         dist_outcomes="normal",
         type_treatments=None,
-        type_covariates=None,
+        type_covariates="str", # If None, "object", "bool" or "category", embedding is done with Compound Embedding, else, with MLP
         mc_sample_size=30,
         best_score=-1e3,
         patience=5,
         distance="element",
         device="cuda",
-        hparams=""
+        hparams="",
+        batch_size
     ):
         super(FCR, self).__init__()
         # generic attributes
@@ -551,6 +554,7 @@ class FCR(nn.Module):
         elif dist == "normal":
             locs = constructions[..., 0]
             scales = F.softplus(constructions[..., 1]).add(eps)
+            scales 
             dist = Normal(
                 loc=locs, scale=scales
             )
@@ -1320,6 +1324,7 @@ class FCR(nn.Module):
                         num_cov, self.hparams["covariate_emb_dim"]
                     ))
             else:
+                ## modified: ????
                 covariates_emb.append(MLP(
                         [num_cov] + [self.hparams["covariate_emb_dim"]] * 2
                     ))

@@ -77,6 +77,12 @@ class MLP(nn.Module):
 
     def forward(self, x):
         out = self.network(x)
+        ## modified: check for NaNs and Inf in the output
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            print("NaNs/Infs detected in MLP output!")
+            print("Input stats -> min:", x.min().item(), "max:", x.max().item())
+            print(x[:, 256:])
+            raise RuntimeError("NaNs in MLP forward output")
 
         if self.heads is not None:
             out = out.view(*out.shape[:-1], -1, self.heads)
