@@ -154,8 +154,10 @@ def train(args, prepare=prepare, state_dict=None):
         else:
             adv_training=False
         # print("Adversarial Training {}".format(adv_training))
-        
+
+        minibatch_counter = 0
         for data in datasets["loader_tr"]:
+            print("Training with minibatch ", minibatch_counter)
             (experiment, treatment, control, _, covariates)= \
             (data[0], data[1], data[2], data[3], data[4:])
           
@@ -164,6 +166,7 @@ def train(args, prepare=prepare, state_dict=None):
                 experiment, treatment, control, covariates, adv_training
             )
             
+            minibatch_counter += 1
             
             ## training with divergence
             # minibatch_training_stats = model.update_divergence(

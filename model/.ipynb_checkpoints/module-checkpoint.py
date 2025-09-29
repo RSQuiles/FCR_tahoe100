@@ -20,22 +20,39 @@ from utils.math_utils import (
 
 
 class CompoundEmbedding(nn.Module):
- def __init__(self, num_embeddings: int, embedding_dim: int) -> None:
-     super().__init__()
-     self.weight = nn.Parameter(torch.empty((num_embeddings, embedding_dim)))
-     self.reset_parameters()
+    """
+    We generate one such Embedding for each covariate.
+    The parameters of each embedding is a matrix of shape (num_categories, embedding_dimension=
 
- def reset_parameters(self) -> None:
-     nn.init.normal_(self.weight)
-
- def forward(self, input: torch.Tensor) -> torch.Tensor:
-     # input: batch_size x num_index
-     weight = torch.cat([self.weight, 
-         torch.zeros((1, self.weight.shape[1]), device=self.weight.device)
-     ], dim=0) # allow -1 indexing
-     weight_rep = weight.repeat(input.shape[1], 1, 1)
-     weight_gat = weight_rep[torch.arange(input.shape[1]), input]
-     return weight_gat.sum(1)
+    Forward method:
+    - Input shape is typically (batch_size = B), ), this is, index for the covariate for all samples
+    - In weight_gat, we index the (repeated) weight matriz with the input, obtaining an embedding for each sample.
+    - This returns a shep of (B, embedding_dim)
+    """
+    def __init__(self, num_embeddings: int, embedding_dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty((num_embeddings, embedding_dim)))
+        self.reset_parameters()
+    
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.weight)
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # input: batch_size x num_index, typically, num_index = 1
+        weight = torch.cat([self.weight, torch.zeros((1, self.weight.shape[1]), device=self.weight.device)], dim=0) # allow -1 indexing
+        weight_rep = weight.repeat(input.shape[1], 1, 1)
+        weight_gat = weight_rep[torch.arange(input.shape[1]), input]
+        out = weight_gat.sum(1)
+        #print("Output: shape --> ", out.shape)
+        #print(weight[0,:])
+        ## modified: check for NaNs and Infs
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            print("NaNs/Infs detected in CompoundEmbedding output!")
+            print("Input stats -> min:", input.min().item(), "max:", input.max().item())
+            print("Input", input)
+            print("Weights_rep: shape-->", weight_rep.shape,"\n", weight_rep)
+            #raise RuntimeError("NaNs in CompundEmbedding forward output")
+        return out
 
 
 class MLP(nn.Module):
@@ -81,7 +98,21 @@ class MLP(nn.Module):
         if torch.isnan(out).any() or torch.isinf(out).any():
             print("NaNs/Infs detected in MLP output!")
             print("Input stats -> min:", x.min().item(), "max:", x.max().item())
-            print(x[:, 256:])
+            print("Input: ", x)
+            print("Output: ", out)
+            for name, param in self.named_parameters():
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    print(f"Parameter {name} has NaNs/Infs!")
+                else:
+                    print(f"Parameter {name} stats -> min: {param.min().item()}, max: {param.max().item()}")
+            
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        print(f"Gradient of {name} has NaNs/Infs!")
+                    else:
+                        print(f"Gradient of {name} stats -> min: {param.grad.min().item()}, max: {param.grad.max().item()}")
+                print(param)
+
             raise RuntimeError("NaNs in MLP forward output")
 
         if self.heads is not None:

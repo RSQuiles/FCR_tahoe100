@@ -24,11 +24,28 @@ def logprob_normal(x, loc, scale, weight=None, eps=1e-8):
 
 def kldiv_normal(mu1: torch.Tensor, sigma1: torch.Tensor,
         mu2: torch.Tensor, sigma2: torch.Tensor) -> torch.Tensor:
-    #print("SHAPES: mu1, sigma1, mu2, sigma2 --> ", mu1.shape, sigma1.shape, mu2.shape, sigma2.shape) 
+    #print("SHAPES: mu1, sigma1, mu2, sigma2 --> ", mu1.shape, sigma1.shape, mu2.shape, sigma2.shape)
+    ## modified: add epsilon to prevent -inf values when applying log
+    eps = 1e-3
+    sigma1 = sigma1.add(eps)
+    sigma2 = sigma2.add(eps)
     logvar1 = 2 * sigma1.log()
     logvar2 = 2 * sigma2.log()
-    return torch.mean(-0.5 * torch.sum(1. + logvar1-logvar2 
-        - (mu1-mu2)** 2 - (logvar1-logvar2).exp(), dim = 1), dim = 0)
+    result = torch.mean(-0.5 * torch.sum(1. + logvar1-logvar2 - (mu1-mu2)** 2 - (logvar1-logvar2).exp(), dim = 1), dim = 0)
+    ## modified: check KL result
+    if torch.isnan(result).any():
+        print("logvar1: ", logvar1)
+        print("logvar2: ", logvar2)
+        print("sigma2: ", sigma2)
+        inputs = [mu1, sigma1, mu2, sigma2]
+        print("INPUTS: mu1, sigma1, mu2, sigma2")
+        for index, entry in enumerate(inputs):
+            if torch.isnan(entry).any():
+                print("Input ", index, "contains NaN")
+                print(entry.tolist())
+        raise RuntimeError("Computed NaN KL Divergence!")
+            
+    return result
 
 def marginalize_latent_tx(latents_mean, latents_stddev,conditions):
     cov_labels = torch.unique(conditions, dim=0)
@@ -66,9 +83,12 @@ def kldiv_normal_marginal(mu1: torch.Tensor, sigma1: torch.Tensor,
     sigma2 = torch.mean(sigma2, dim=0)
     logvar1 = 2 * sigma1.log()
     logvar2 = 2 * sigma2.log()
-
-    return torch.mean(-0.5 * torch.sum(1. + logvar1-logvar2 
-        - (mu1-mu2)** 2 - (logvar1-logvar2).exp(), dim = 1), dim = 0)
+    result = torch.mean(-0.5 * torch.sum(1. + logvar1-logvar2 - (mu1-mu2)** 2 - (logvar1-logvar2).exp(), dim = 1), dim = 0)
+    ## modified: check KL result
+    if torch.isnan(result).any:
+        print("INPUTS: mu1, sigma1, mu2, sigma2 --> ", mu1, sigma1, mu2, sigma2)
+        raise RuntimeErroe("Computed NaN KL Divergence")
+    return result
 
 def aggregate_normal_distr(mus: list, sigmas: list):
     mus = torch.cat(mus, dim=1)

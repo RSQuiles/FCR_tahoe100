@@ -10,6 +10,7 @@ from .module import (
     CompoundEmbedding, MLP,
     Bernoulli, NegativeBinomial, ZeroInflatedNegativeBinomial
 )
+import torch.nn.utils as nn_utils
 
 from utils.math_utils import (
     logprob_normal, kldiv_normal,
@@ -67,6 +68,7 @@ class FCR(nn.Module):
         num_outcomes,
         num_treatments,
         num_covariates,
+        batch_size, ## modified: added argument
         embed_outcomes=True,
         embed_treatments=False,
         embed_covariates=True,
@@ -76,14 +78,13 @@ class FCR(nn.Module):
         dist_mode="match",
         dist_outcomes="normal",
         type_treatments=None,
-        type_covariates="str", # If None, "object", "bool" or "category", embedding is done with Compound Embedding, else, with MLP
+        type_covariates=None, # If None, "object", "bool" or "category", embedding is done with Compound Embedding, else, with MLP
         mc_sample_size=30,
         best_score=-1e3,
         patience=5,
         distance="element",
         device="cuda",
         hparams="",
-        batch_size
     ):
         super(FCR, self).__init__()
         # generic attributes
@@ -364,6 +365,18 @@ class FCR(nn.Module):
         
         
     def encode_ZX(self, outcomes, covariates, eval=False):
+        """
+        Inputs:
+        - covariates: Python list, one tensor of shape (batch_size = B,) per covariate
+        - self.covariates_embeddings: list of Compound Embeddings, one per covariate
+
+        After the embedding:
+        - emb(covars) returns shape (B, emb_dim), for each covariate
+        - Thus, concatenating along the last dimension of covariates returns shape (B, sum_embedding_dimension), where
+        sum_embedding_dimension = embd_dim_0 + emb_dim_1 + ...
+
+        This is then concatenated with the outcomes, and inputted to the encoder, with an adequate shape.
+        """
         
         if self.embed_outcomes:
             #print("outcomes shape:", outcomes.shape)
@@ -1193,6 +1206,7 @@ class FCR(nn.Module):
 
             self.optimizer_autoencoder.zero_grad()
             loss.backward()
+            # nn_utils.clip_grad_norm_(self.parameters(), max_norm=1.0) ## modified: avoid exploding gradients
             self.optimizer_autoencoder.step()
             self.iteration += 1
             

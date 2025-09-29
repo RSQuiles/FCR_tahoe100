@@ -152,8 +152,7 @@ class Dataset:
                 names = np.unique(values)
                 self.num_covariates.append(len(names))
 
-                ## modified: added dtype to ensure compatibility with MLP when pre-embeddings covariates
-                names_idx = torch.arange(len(names), dtype=torch.float32).unsqueeze(-1)
+                names_idx = torch.arange(len(names)).unsqueeze(-1)
                 self.covars_dict[cov] = dict(
                     zip(list(names), names_idx)
                 )
