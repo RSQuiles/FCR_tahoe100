@@ -26,7 +26,7 @@ class CompoundEmbedding(nn.Module):
 
     Forward method:
     - Input shape is typically (batch_size = B), ), this is, index for the covariate for all samples
-    - In weight_gat, we index the (repeated) weight matriz with the input, obtaining an embedding for each sample.
+    - In weight_gat, we index the (repeated) weight matrix with the input, obtaining an embedding for each sample.
     - This returns a shep of (B, embedding_dim)
     """
     def __init__(self, num_embeddings: int, embedding_dim: int) -> None:
