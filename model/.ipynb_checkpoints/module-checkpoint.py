@@ -50,6 +50,7 @@ class CompoundEmbedding(nn.Module):
             print("NaNs/Infs detected in CompoundEmbedding output!")
             print("Input stats -> min:", input.min().item(), "max:", input.max().item())
             print("Input", input)
+            print("Output", out)
             print("Weights_rep: shape-->", weight_rep.shape,"\n", weight_rep)
             #raise RuntimeError("NaNs in CompundEmbedding forward output")
         return out

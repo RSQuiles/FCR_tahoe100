@@ -157,7 +157,6 @@ def train(args, prepare=prepare, state_dict=None):
 
         minibatch_counter = 0
         for data in datasets["loader_tr"]:
-            print("Training with minibatch ", minibatch_counter)
             (experiment, treatment, control, _, covariates)= \
             (data[0], data[1], data[2], data[3], data[4:])
           
