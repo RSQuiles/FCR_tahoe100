@@ -12,7 +12,7 @@ from .module import (
 )
 import torch.nn.utils as nn_utils
 
-from utils.math_utils import (
+from ..utils.math_utils import (
     logprob_normal, kldiv_normal,
     kldiv_normal_marginal,
     logprob_bernoulli_logits,
@@ -41,6 +41,9 @@ def load_FCR(args, state_dict=None):
         args["num_outcomes"],
         args["num_treatments"],
         args["num_covariates"],
+        embed_outcomes=args["embed_outcomes"],
+        embed_treatments=args["embed_treatments"],
+        embed_covariates=args["embed_covariates"],
         omega0=args["omega0"],
         omega1=args["omega1"],
         omega2=args["omega2"],
@@ -126,7 +129,7 @@ class FCR(nn.Module):
     def _set_hparams_(self, hparams):
         """
         Set hyper-parameters to default values or values fixed by user for those
-        hyper-parameters specified in the JSON string `hparams`.
+        hyper-parameters, which can be specified  as a JSON object, or a JSON string.
         """
 
         self.hparams = {
@@ -152,7 +155,6 @@ class FCR(nn.Module):
             "step_size_lr": 45,
         }
 
-        # the user may fix some hparams
         if hparams != "":
             if isinstance(hparams, str):
                 with open(hparams) as f:
@@ -1596,9 +1598,10 @@ class FCR(nn.Module):
             ZX, ZXT, ZT = self.get_latent(
                 outcomes, treatments, covariates
             )
-            ZX_resample = self.sample_latent(ZX[0], torch.ones(ZX[1].shape), device="cuda")
-            ZXT_resample = self.sample_latent(ZXT[0], torch.ones(ZXT[1].shape), device="cuda")
-            ZT_resample = self.sample_latent(ZT[0], torch.ones(ZT[1].shape), device="cuda")
+            ## modified: ??? how does this double resampling even make sense?
+            ZX_resample = self.sample_latent(ZX[0], torch.ones(ZX[1].shape, device="cuda"))
+            ZXT_resample = self.sample_latent(ZXT[0], torch.ones(ZXT[1].shape, device="cuda"))
+            ZT_resample = self.sample_latent(ZT[0], torch.ones(ZT[1].shape, device="cuda"))
             return ZX_resample,ZXT_resample, ZT_resample
             
             

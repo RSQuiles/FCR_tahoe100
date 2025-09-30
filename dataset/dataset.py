@@ -1,13 +1,12 @@
 from typing import Union
-
 import scipy
 import numpy as np
 import scanpy as sc
 
 import torch
 
-from utils.general_utils import unique_ind
-from utils.data_utils import rank_genes_groups
+from ..utils.general_utils import unique_ind
+from ..utils.data_utils import rank_genes_groups
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -419,7 +418,7 @@ def load_dataset_train_test(
     control_key: str = "control",
     dose_key: str = "dose",
     covariate_keys: Union[list, str] = "covariates",
-    split_key: str = "new_split",
+    split_key: str = "split",
     sample_cf: bool = False,
     return_dataset: bool = False,
 ):
@@ -433,6 +432,8 @@ def load_dataset_train_test(
         "train": dataset.subset("train", "all"),
         "test": dataset.subset("test", "all"),
         "ood": dataset.subset("test", "all"),
+        ## modified: returns whole dataset for testing and visualization
+        "all": dataset.subset("all","all")
     }
 
     if return_dataset:

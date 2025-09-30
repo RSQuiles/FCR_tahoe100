@@ -9,15 +9,15 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from evaluate.evaluate import evaluate, evaluate_classic,evaluate_prediction
+from ..evaluate.evaluate import evaluate, evaluate_classic,evaluate_prediction
 
-from model import load_FCR
+from ..model import load_FCR
 
 
-from dataset.dataset import load_dataset_splits,load_dataset_train_test
+from ..dataset.dataset import load_dataset_splits,load_dataset_train_test
 
-from utils.general_utils import initialize_logger, ljson
-from utils.data_utils import data_collate
+from ..utils.general_utils import initialize_logger, ljson
+from ..utils.data_utils import data_collate
 
 def prepare_extract(args, state_dict=None):
     # dataset
@@ -56,8 +56,8 @@ def prepare_extract(args, state_dict=None):
     return model, datasets
 
     
-
-def prepare(args, state_dict=None):
+## modified: add split to select desired dataste
+def prepare(args, state_dict=None, split_name="train"):
     """
     Instantiates model and dataset to run an experiment.
     """
@@ -69,8 +69,8 @@ def prepare(args, state_dict=None):
 #         split_key = "split"
     
     
-#     # dataset
-    if args['covariate_keys']!=None:
+    # dataset
+    if args['covariate_keys']!= None:
         covariate_keys = args['covariate_keys']
     else:
         covariate_keys = 'covariates'
@@ -80,7 +80,7 @@ def prepare(args, state_dict=None):
     else:
         perturbation_key = "Agg_Treatment"
         
-    if args['split']!=None:
+    if args['split']!= None:
         split_key = args["split"]
     
     
@@ -102,7 +102,7 @@ def prepare(args, state_dict=None):
     datasets.update(
         {
             "loader_tr": torch.utils.data.DataLoader(
-                datasets["train"],
+                datasets[split_name],
                 batch_size=args["batch_size"],
                 shuffle=False,
                 collate_fn=(lambda batch: data_collate(batch, nb_dims=1))
@@ -157,7 +157,7 @@ def train(args, prepare=prepare, state_dict=None):
 
         minibatch_counter = 0
         for data in datasets["loader_tr"]:
-            print("Training with minibatch ", minibatch_counter)
+            # print("Training with minibatch ", minibatch_counter)
             (experiment, treatment, control, _, covariates)= \
             (data[0], data[1], data[2], data[3], data[4:])
           

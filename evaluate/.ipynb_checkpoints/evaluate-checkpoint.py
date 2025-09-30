@@ -4,7 +4,7 @@ from sklearn.metrics import r2_score
 
 import torch
 
-from utils.general_utils import unique_ind
+from ..utils.general_utils import unique_ind
 
 def evaluate(model, datasets, batch_size=None):
     """
