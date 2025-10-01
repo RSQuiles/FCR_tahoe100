@@ -1137,7 +1137,7 @@ class FCR(nn.Module):
         ZTs_control = torch.cat([ZT_control_resample, ZXT_control_resample], dim=1)
         treatment_constr = self.intervention_decode(ZTs, ZTs_control)
 
-        ## modified: had ZT_control_dist and ZT_control_stddev twice when concatenating the latents
+        ## modified: had ZT_control_dist.mean and ZT_control_stddev twice when concatenating the latents
         control_latents_dist_mean = torch.cat([ZX_control_dist.mean, ZXT_control_dist.mean, ZT_control_dist.mean], dim=1)
         control_latents_dist_stddev = torch.cat([ZX_control_dist.stddev, ZXT_control_dist.stddev, ZT_control_dist.stddev], dim=1)
         ## modified: stack means and stddev along last dimension to generate distribution object with .mean and .stddev [batch_size x dimensions]

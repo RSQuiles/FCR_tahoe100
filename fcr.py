@@ -18,9 +18,11 @@ import json
 
 
 class FCR_sim:
-    def __init__(self, config_path=None, model_path=None):
+    def __init__(self, config_path=None, model_path=None, dataset_mode="train"):
+        # Importing mode for dataset
+        self.dataset_mode = dataset_mode
         if model_path != None:
-            self.load_model(model_path)
+            self.load_model(model_path, self.dataset_mode)
         elif config_path != None:
             self.arguments = self.parse_arguments(config_path)
         else:
