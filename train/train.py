@@ -207,7 +207,7 @@ def train(args, prepare=prepare, state_dict=None):
                     "training_stats": epoch_training_stats,
                     "evaluation_stats": evaluation_stats,
                     "ellapsed_minutes": ellapsed_minutes,
-                    "Discrinimator Training": adv_training
+                    "Discriminator Training": adv_training
                 }
             )
 
