@@ -211,7 +211,7 @@ class FCR(nn.Module):
         self.encoder_ZXT = self.init_encoder_XT()
 
         
-        ## modified: uncommented control encoder, control_prior and their respective parameters
+        ## modified: commented control encoder, control_prior and their respective parameters
         # self.control_encoder = self.init_encoder_control()
         params.extend(list(self.encoder_ZX.parameters()))
         params.extend(list(self.encoder_ZT.parameters()))
@@ -624,7 +624,7 @@ class FCR(nn.Module):
         sample1 = marginalize_latent(sample1, conditions)
         ZX1 = sample1[:, :self.ZX_dim]
         ZXT1 = sample1[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]
-        label1 = torch.ones(sample1.shape[0], device="cuda", dtype=torch.float32).unsqueeze(1)
+        label1 = torch.ones(sample1.shape[0], device=self.device, dtype=torch.float32).unsqueeze(1)
         original = torch.cat([ZX1, ZXT1, label1], -1)
         
         
@@ -632,7 +632,7 @@ class FCR(nn.Module):
         sample2 = self.sample_latent(mu, sigma, size=1)
         sample2 = marginalize_latent(sample2, conditions)
         ZXT2 = sample2[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]
-        label2 = torch.zeros(sample2.shape[0],device="cuda", dtype=torch.float32).unsqueeze(1)
+        label2 = torch.zeros(sample2.shape[0],device=self.device, dtype=torch.float32).unsqueeze(1)
         perturbed = torch.cat([ZX1, ZXT2,label2], -1)
         # print("orignal shape {}, perturb shape {}".format(original.shape, perturbed.shape))
         
@@ -649,14 +649,14 @@ class FCR(nn.Module):
         sample1 = marginalize_latent(sample1, conditions)
         ZT1 = sample1[:, self.ZX_dim+self.ZXT_dim:]
         ZXT1 = sample1[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]
-        label1 = torch.ones(sample1.shape[0], dtype=torch.float32,device="cuda").unsqueeze(1)
+        label1 = torch.ones(sample1.shape[0], dtype=torch.float32,device=self.device).unsqueeze(1)
         original = torch.cat([ZXT1,ZT1,label1], -1)
         
         ## resample the ZXT
         sample2 = self.sample_latent(mu, sigma, size=1)
         sample2 = marginalize_latent(sample2, conditions)
         ZXT2 = sample2[:, self.ZX_dim+self.ZXT_dim:]
-        label2 = torch.zeros(sample2.shape[0], dtype=torch.float32,device="cuda").unsqueeze(1)
+        label2 = torch.zeros(sample2.shape[0], dtype=torch.float32,device=self.device).unsqueeze(1)
         perturbed = torch.cat([ZXT2,ZT1,label2], -1)
         # print("orignal shape {}, perturb shape {}".format(original.shape, perturbed.shape))
         
@@ -987,7 +987,7 @@ class FCR(nn.Module):
         ## modified: index as ZX_dist[...,0/1] to get last dimension, instead of ZX_dist[0/1]
         #print("ZX_dist: ", ZX_dist.shape)
         marginal_ZX = marginalize_latent_tx(ZX_dist[...,0], ZX_dist[...,1], conditions)
-        kl_divergence_X = torch.tensor(0, dtype=torch.float64, device="cuda")
+        kl_divergence_X = torch.tensor(0, dtype=torch.float64, device=self.device)
         # print("marginal_ZX_prior device {}, ZX device {}".format(marginal_ZX_prior.device(), marginal_ZX.device()))
         for i in range(conditions_labels.shape[0]):
             kl_divergence_X +=kldiv_normal(
@@ -1002,7 +1002,7 @@ class FCR(nn.Module):
         marginal_ZT_prior =  marginalize_latent_tx(ZT_prior_dist.mean, ZT_prior_dist.stddev, conditions)
         ## modified: index as ZX_dist[...,0/1] to get last dimension, instead of ZX_dist[0/1]
         marginal_ZT = marginalize_latent_tx(ZT_dist[...,0], ZT_dist[...,1], conditions)
-        kl_divergence_T = torch.tensor(0, dtype=torch.float64, device="cuda")
+        kl_divergence_T = torch.tensor(0, dtype=torch.float64, device=self.device)
         for i in range(conditions_labels.shape[0]):
             kl_divergence_T +=kldiv_normal(
             marginal_ZT_prior[0][i],
@@ -1016,7 +1016,7 @@ class FCR(nn.Module):
         marginal_ZXT_prior =  marginalize_latent_tx(ZXT_prior_dist.mean, ZXT_prior_dist.stddev, conditions)
         ## modified: index as ZX_dist[...,0/1] to get last dimension, instead of ZX_dist[0/1]
         marginal_ZXT = marginalize_latent_tx(ZXT_dist[...,0], ZXT_dist[...,1], conditions)
-        kl_divergence_XT = torch.tensor(0,dtype=torch.float64, device="cuda")
+        kl_divergence_XT = torch.tensor(0,dtype=torch.float64, device=self.device)
         for i in range(conditions_labels.shape[0]):
             kl_divergence_XT +=kldiv_normal(
             marginal_ZXT_prior[0][i],
@@ -1045,7 +1045,7 @@ class FCR(nn.Module):
         
         ## esitimation latents for controls
         # q(z_control | y_control, x)
-        control_treatment = torch.zeros(treatments.shape, dtype=torch.float32, device="cuda")
+        control_treatment = torch.zeros(treatments.shape, dtype=torch.float32, device=self.device)
         ZX_control_constr = self.encode_ZX(control_outcomes, covariates)
         ZX_control_dist = self.distributionize(
             ZX_control_constr, dim=self.hparams["ZX_dim"], dist="normal"
@@ -1185,9 +1185,11 @@ class FCR(nn.Module):
         
             perturb_X = self.permutation_distribution_X(exp_dist.mean, exp_dist.stddev,conditions)
             perturb_T = self.permutation_distribution_T(exp_dist.mean, exp_dist.stddev,conditions)
-            with torch.no_grad():
-                permute_T_pred = self.discriminate_T(perturb_T[:, :-1])
-                permute_X_pred = self.discriminate_X(perturb_X[:, :-1])
+
+            ## modified: activated gradient
+            # with torch.no_grad():
+            permute_T_pred = self.discriminate_T(perturb_T[:, :-1])
+            permute_X_pred = self.discriminate_X(perturb_X[:, :-1])
                 
             permute_T_loss = self.loss_discriminator_T(permute_T_pred, perturb_T[:, -1]) 
             permute_X_loss = self.loss_discriminator_X(permute_X_pred, perturb_X[:, -1])
@@ -1599,9 +1601,9 @@ class FCR(nn.Module):
                 outcomes, treatments, covariates
             )
             ## modified: ??? how does this double resampling even make sense?
-            ZX_resample = self.sample_latent(ZX[0], torch.ones(ZX[1].shape, device="cuda"))
-            ZXT_resample = self.sample_latent(ZXT[0], torch.ones(ZXT[1].shape, device="cuda"))
-            ZT_resample = self.sample_latent(ZT[0], torch.ones(ZT[1].shape, device="cuda"))
+            ZX_resample = self.sample_latent(ZX[0], torch.ones(ZX[1].shape, device=self.device))
+            ZXT_resample = self.sample_latent(ZXT[0], torch.ones(ZXT[1].shape, device=self.device))
+            ZT_resample = self.sample_latent(ZT[0], torch.ones(ZT[1].shape, device=self.device))
             return ZX_resample,ZXT_resample, ZT_resample
             
             
