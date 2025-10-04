@@ -12,7 +12,7 @@ from .module import (
 )
 import torch.nn.utils as nn_utils
 
-from ..utils.math_utils import (
+from utils.math_utils import (
     logprob_normal, kldiv_normal,
     kldiv_normal_marginal,
     logprob_bernoulli_logits,
@@ -47,6 +47,7 @@ def load_FCR(args, state_dict=None):
         omega0=args["omega0"],
         omega1=args["omega1"],
         omega2=args["omega2"],
+        omega3=args.get("omega3", 1.0),
         dist_mode=args["dist_mode"],
         dist_outcomes=args["dist_outcomes"],
         patience=args["patience"],
@@ -73,11 +74,13 @@ class FCR(nn.Module):
         num_covariates,
         batch_size, ## modified: added argument
         embed_outcomes=True,
+        
         embed_treatments=False,
         embed_covariates=True,
         omega0=1.0,
         omega1=2.0,
         omega2=2.0,
+        omega3=1.0,
         dist_mode="match",
         dist_outcomes="normal",
         type_treatments=None,
@@ -86,7 +89,7 @@ class FCR(nn.Module):
         best_score=-1e3,
         patience=5,
         distance="element",
-        device="cuda",
+        device="cpu",
         hparams="",
     ):
         super(FCR, self).__init__()
@@ -105,6 +108,8 @@ class FCR(nn.Module):
         self.omega0 = omega0
         self.omega1 = omega1
         self.omega2 = omega2
+        # NEW: weight for permutation discriminators
+        self.omega3 = omega3
         self.dist_mode = dist_mode
         # early-stopping
         self.best_score = best_score
@@ -211,22 +216,22 @@ class FCR(nn.Module):
         self.encoder_ZXT = self.init_encoder_XT()
 
         
-        ## modified: commented control encoder, control_prior and their respective parameters
-        # self.control_encoder = self.init_encoder_control()
+        ## control encoder brings in control-specific latent path
+        self.control_encoder = self.init_encoder_control()
         params.extend(list(self.encoder_ZX.parameters()))
         params.extend(list(self.encoder_ZT.parameters()))
         params.extend(list(self.encoder_ZXT.parameters()))
-        # params.extend(list(self.control_encoder.parameters()))
-        
+        params.extend(list(self.control_encoder.parameters()))
+
         ## initialize the prior encoders
         self.encoder_ZX_prior = self.init_encoder_X_prior()
         self.encoder_ZT_prior = self.init_encoder_T_prior()
         self.encoder_ZXT_prior = self.init_encoder_XT_prior()
-        # self.control_prior = self.init_control_prior()
+        self.control_prior = self.init_control_prior()
         params.extend(list(self.encoder_ZX_prior.parameters()))
         params.extend(list(self.encoder_ZT_prior.parameters()))
         params.extend(list(self.encoder_ZXT_prior.parameters()))
-        # params.extend(list(self.control_prior.parameters()))
+        params.extend(list(self.control_prior.parameters()))
 
         ## eval models
         ## modified: added self.exp_encoder_eval, commented out control_encoder_eval and control_prior_eval
@@ -238,12 +243,13 @@ class FCR(nn.Module):
         self.encoder_ZX_prior_eval = copy.deepcopy(self.encoder_ZX_prior)
         self.encoder_ZT_prior_eval = copy.deepcopy(self.encoder_ZT_prior)
         self.encoder_ZXT_prior_eval = copy.deepcopy(self.encoder_ZXT_prior)
-        # self.control_encoder_eval = copy.deepcopy(self.control_encoder)
-        # self.control_prior_eval = copy.deepcopy(self.control_prior)
+        self.control_encoder_eval = copy.deepcopy(self.control_encoder)
+        self.control_prior_eval = copy.deepcopy(self.control_prior)
 
         self.decoder = self.init_decoder_experiments()
         params.extend(list(self.decoder.parameters()))
-        # params.extend(list(self.control_decoder.parameters()))
+        self.control_decoder = self.init_decoder_control()
+        params.extend(list(self.control_decoder.parameters()))
         
         ## covariate decoder
         self.cov_decoder = self.init_decoder_cov()
@@ -303,6 +309,8 @@ class FCR(nn.Module):
         self.discriminator_T = self.init_discriminator_T()
         self.loss_discriminator_T = nn.BCEWithLogitsLoss()
         params.extend(list(self.discriminator_T.parameters()))
+        # NEW: define a generic BCE loss to avoid AttributeError in legacy code
+        self.loss_discriminator = nn.BCEWithLogitsLoss()
         # print("initialized discriminator {}".format(self.discriminator_T))
 
         self.optimizer_discriminator = torch.optim.Adam(
@@ -569,7 +577,7 @@ class FCR(nn.Module):
         elif dist == "normal":
             locs = constructions[..., 0]
             scales = F.softplus(constructions[..., 1]).add(eps)
-            scales 
+            # BUG: stray 'scales' token removed
             dist = Normal(
                 loc=locs, scale=scales
             )
@@ -581,17 +589,7 @@ class FCR(nn.Module):
 
         return dist
 
-    def sample(self, mu: torch.Tensor, sigma: torch.Tensor, treatments: torch.Tensor, 
-            size=1) -> torch.Tensor:
-        mu = mu.repeat(size, 1)
-        sigma = sigma.repeat(size, 1)
-        treatments = treatments.repeat(size, 1)
-
-        latents = self.reparameterize(mu, sigma)
-
-        return self.decode(latents, treatments)
-    
-    
+    # BUG: deprecated sample() (mismatched decode signature) disabled; use sample_expr()
     def sample_latent(self,  mu: torch.Tensor, sigma: torch.Tensor, size=1):
         
         mu = mu.repeat(size, 1)
@@ -655,7 +653,7 @@ class FCR(nn.Module):
         ## resample the ZXT
         sample2 = self.sample_latent(mu, sigma, size=1)
         sample2 = marginalize_latent(sample2, conditions)
-        ZXT2 = sample2[:, self.ZX_dim+self.ZXT_dim:]
+        ZXT2 = sample2[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]  # BUGFIX: was taking ZT slice
         label2 = torch.zeros(sample2.shape[0], dtype=torch.float32,device=self.device).unsqueeze(1)
         perturbed = torch.cat([ZXT2,ZT1,label2], -1)
         # print("orignal shape {}, perturb shape {}".format(original.shape, perturbed.shape))
@@ -704,7 +702,7 @@ class FCR(nn.Module):
         
         ## resample the ZXT
         sample2 = self.sample_latent(mu, sigma, size)
-        ZXT2 = sample2[:, self.ZX_dim+self.ZXT_dim:]
+        ZXT2 = sample2[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]  # BUGFIX: was taking ZT slice
         label2 = torch.zeros(sample2.shape[-1], dtype=torch.float64)
         perturbed = torch.cat([ZXT2,ZT1,label2], -1)
         print("orignal shape {}, perturb shape {}".format(original.shape, perturbed.shape))
@@ -733,9 +731,9 @@ class FCR(nn.Module):
             cf_treatments = treatments
 
         with torch.autograd.no_grad():
-            latents_constr = self.encode_exp(outcomes, treatments, covariates)
+            latents_constr = self.encode_exp(outcomes, covariates, treatments)
             latents_dist = self.distributionize(
-                latents_constr, dim=self.hparams["latent_dim"], dist="normal"
+                latents_constr, dim=self.hparams["latent_exp_dim"], dist="normal"
             )
 
             outcomes_constr = self.decode(latents_dist.mean)
@@ -789,35 +787,9 @@ class FCR(nn.Module):
         else:
             return outcomes_dist.mean    
 
-    def generate(
-        self,
-        outcomes,
-        treatments,
-        cf_treatments,
-        covariates,
-        return_dist=False
-    ):
-        outcomes, treatments, cf_treatments, covariates = self.move_inputs(
-            outcomes, treatments, cf_treatments, covariates
-        )
-        if cf_treatments is None:
-            cf_treatments = treatments
-
-        with torch.autograd.no_grad():
-            latents_constr = self.encode(outcomes, treatments, covariates)
-            latents_dist = self.distributionize(
-                latents_constr, dim=self.hparams["latent_dim"], dist="normal"
-            )
-
-            outcomes_constr_samp = self.sample(
-                latents_dist.mean, latents_dist.stddev, cf_treatments
-            )
-            outcomes_dist_samp = self.distributionize(outcomes_constr_samp)
-
-        if return_dist:
-            return outcomes_dist_samp
-        else:
-            return outcomes_dist_samp.mean
+    # BUG: generate() relied on undefined self.encode and a mismatched sample(); disabled for safety
+    # def generate(...):
+    #     pass
 
     def logprob(self, outcomes, outcomes_param, dist=None):
         """
@@ -898,10 +870,12 @@ class FCR(nn.Module):
                     treatments, cf_treatments, covariates
                 )
 
-            covar_spec_nllh = self.loss_discriminator(
-                self.discriminate(cf_outcomes_out, cf_treatments, covariates),
-                torch.ones(cf_outcomes_out.size(0), device=cf_outcomes_out.device)
-            )
+            # BUG: legacy path expected self.discriminate() and self.loss_discriminator (not defined). 
+            # covar_spec_nllh = self.loss_discriminator(
+            #     self.discriminate(cf_outcomes_out, cf_treatments, covariates),
+            #     torch.ones(cf_outcomes_out.size(0), device=cf_outcomes_out.device)
+            # )
+            covar_spec_nllh = torch.tensor(0.0, device=cf_outcomes_out.device)  # keep placeholder so code runs
         elif self.dist_mode == "fit":
             raise NotImplementedError(
                 'TODO: implement dist_mode "fit" for distribution loss')
@@ -1045,7 +1019,7 @@ class FCR(nn.Module):
         
         ## esitimation latents for controls
         # q(z_control | y_control, x)
-        control_treatment = torch.zeros(treatments.shape, dtype=torch.float32, device=self.device)
+        control_treatment = torch.zeros(treatments.shape, dtype=torch.float32, device=treatments.device)
         ZX_control_constr = self.encode_ZX(control_outcomes, covariates)
         ZX_control_dist = self.distributionize(
             ZX_control_constr, dim=self.hparams["ZX_dim"], dist="normal"
@@ -1061,7 +1035,6 @@ class FCR(nn.Module):
         ZXT_control_dist = self.distributionize(
             ZXT_control_constr, dim=self.hparams["ZXT_dim"], dist="normal"
         )
-        
         ## estimation latents for experiments
         
         
@@ -1080,7 +1053,13 @@ class FCR(nn.Module):
         ZXT_dist = self.distributionize(
             ZXT_constr, dim=self.hparams["ZXT_dim"], dist="normal"
         )
-        
+
+        # NEW: Causal structure regularizer (Eq.16): L_sim = sim(z_t, z_t^0) - sim(z_x, z_x^0)
+        # Use means of variational posteriors as embeddings for stability.
+        sim_t = F.cosine_similarity(ZT_constr[..., 0], ZT_control_constr[..., 0], dim=1).mean()
+        sim_x = F.cosine_similarity(ZX_constr[..., 0], ZX_control_constr[..., 0], dim=1).mean()
+        sim_loss = sim_t - sim_x
+
         
         ZT_control_prior = self.encode_ZT_prior(control_treatment)
         ZT_control_prior_dist = self.distributionize(
@@ -1141,22 +1120,47 @@ class FCR(nn.Module):
         control_latents_dist_mean = torch.cat([ZX_control_dist.mean, ZXT_control_dist.mean, ZT_control_dist.mean], dim=1)
         control_latents_dist_stddev = torch.cat([ZX_control_dist.stddev, ZXT_control_dist.stddev, ZT_control_dist.stddev], dim=1)
         ## modified: stack means and stddev along last dimension to generate distribution object with .mean and .stddev [batch_size x dimensions]
-        control_latents_dist = self.distributionize(torch.stack([control_latents_dist_mean, control_latents_dist_stddev], dim=-1))
-        control_outcomes_constr_samp = self.sample_expr(control_latents_dist_mean, control_latents_dist_stddev, size=self.mc_sample_size
+        control_latents_dist = self.distributionize(
+            torch.stack([control_latents_dist_mean, control_latents_dist_stddev], dim=-1),
+            dim=control_latents_dist_mean.size(1),
+            dist="normal",
+        )
+        control_outcomes_constr_samp = self.sample_control(
+            control_latents_dist_mean,
+            control_latents_dist_stddev,
+            size=self.mc_sample_size,
         )
         control_outcomes_dist_samp = self.distributionize(control_outcomes_constr_samp)
 
         exp_latents_dist_mean = torch.cat([ZX_dist.mean, ZXT_dist.mean, ZT_dist.mean], dim=1)
         exp_latents_dist_stddev = torch.cat([ZX_dist.stddev, ZXT_dist.stddev, ZT_dist.stddev], dim=1)
         ## modified: stack means and stddev along last dimension to generate distribution object with .mean and .stddev [batch_size x dimensions]
-        exp_dist = self.distributionize(torch.stack([exp_latents_dist_mean, exp_latents_dist_stddev], dim=-1))
+        exp_dist = self.distributionize(
+            torch.stack([exp_latents_dist_mean, exp_latents_dist_stddev], dim=-1),
+            dim=exp_latents_dist_mean.size(1),
+            dist="normal",
+        )
         # print("exp_dist.mean, exp_dist.stddev: ", exp_dist.mean.shape, exp_dist.stddev.shape)
         
         expr_outcomes_constr_samp = self.sample_expr(exp_latents_dist_mean, exp_latents_dist_stddev, size=self.mc_sample_size)
         expr_outcomes_dist_samp = self.distributionize(expr_outcomes_constr_samp)
 
-        results = [control_outcomes_dist_samp,expr_outcomes_dist_samp, exp_dist, ZX_constr, ZT_constr, ZXT_constr, ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist,\
-                  control_latents_dist, control_prior_dist,cov_constr, treatment_constr]      
+        results = [
+            control_outcomes_dist_samp,
+            expr_outcomes_dist_samp,
+            exp_dist,
+            ZX_constr,
+            ZT_constr,
+            ZXT_constr,
+            ZX_prior_dist,
+            ZT_prior_dist,
+            ZXT_prior_dist,
+            control_latents_dist,
+            control_prior_dist,
+            cov_constr,
+            treatment_constr,
+            sim_loss,
+        ]
             
         return results
 
@@ -1172,7 +1176,7 @@ class FCR(nn.Module):
         if not adv_training: 
             control_outcomes_dist_samp, expr_outcomes_dist_samp, exp_dist, ZX, ZT, ZXT, \
             ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_latents_dist, control_prior_dist, \
-            cov_constr, treatment_constr = self.forward(
+            cov_constr, treatment_constr, sim_loss = self.forward(
                 expr_outcomes, treatments, control_outcomes, covariates
             )
 
@@ -1185,9 +1189,12 @@ class FCR(nn.Module):
         
             perturb_X = self.permutation_distribution_X(exp_dist.mean, exp_dist.stddev,conditions)
             perturb_T = self.permutation_distribution_T(exp_dist.mean, exp_dist.stddev,conditions)
-
-            ## modified: activated gradient
-            # with torch.no_grad():
+            # BUGFIX: using torch.no_grad() here blocks gradients to encoders; we need gradients.
+            # Freeze discriminator params but keep graph for inputs.
+            for p in self.discriminator_T.parameters():
+                p.requires_grad_(False)
+            for p in self.discriminator_X.parameters():
+                p.requires_grad_(False)
             permute_T_pred = self.discriminate_T(perturb_T[:, :-1])
             permute_X_pred = self.discriminate_X(perturb_X[:, :-1])
                 
@@ -1196,7 +1203,8 @@ class FCR(nn.Module):
             permute_loss =  0.5 * (permute_T_loss + permute_X_loss)
 
             indiv_spec_nllh = indiv_spec_nllh_control + indiv_spec_nllh_experiments
-            covar_spec_nllh = treatment_loss + cov_loss
+            # Include causal structure regularizer
+            covar_spec_nllh = treatment_loss + cov_loss + sim_loss
             kl_divergence_factored = kl_divergence_X+kl_divergence_T+kl_divergence_XT
             kl_divergence_samples= kl_divergence_control + kl_divergence_ind
             kl_divergence = kl_divergence_factored + kl_divergence_samples
@@ -1205,13 +1213,18 @@ class FCR(nn.Module):
                 + self.omega1 * covar_spec_nllh
                 + self.omega2 * kl_divergence_samples
                 + self.omega2 * kl_divergence_factored
-                -  permute_loss   
+                -  self.omega3 * permute_loss   
             )
 
             self.optimizer_autoencoder.zero_grad()
             loss.backward()
             # nn_utils.clip_grad_norm_(self.parameters(), max_norm=1.0) ## modified: avoid exploding gradients
             self.optimizer_autoencoder.step()
+            # Re-enable discriminator params
+            for p in self.discriminator_T.parameters():
+                p.requires_grad_(True)
+            for p in self.discriminator_X.parameters():
+                p.requires_grad_(True)
             self.iteration += 1
             
             return {
@@ -1224,8 +1237,8 @@ class FCR(nn.Module):
         else:
             with torch.no_grad():
                 control_outcomes_dist_samp, expr_outcomes_dist_samp, exp_dist, ZX, ZT, ZXT, \
-                ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_latents_dist, control_prior_dist, \
-                cov_constr, treatment_constr = self.forward(expr_outcomes, treatments, control_outcomes, covariates)
+            ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_latents_dist, control_prior_dist, \
+            cov_constr, treatment_constr, sim_loss = self.forward(expr_outcomes, treatments, control_outcomes, covariates)
                 
                 indiv_spec_nllh_control, indiv_spec_nllh_experiments, cov_loss, treatment_loss,\
                 kl_divergence_ind, kl_divergence_X, kl_divergence_T, kl_divergence_XT,kl_divergence_control ,conditions, conditions_labels= \
@@ -1242,7 +1255,8 @@ class FCR(nn.Module):
             
             
             indiv_spec_nllh = indiv_spec_nllh_control + indiv_spec_nllh_experiments
-            covar_spec_nllh = treatment_loss + cov_loss
+            # Include causal structure regularizer
+            covar_spec_nllh = treatment_loss + cov_loss + sim_loss
             kl_divergence_factored = kl_divergence_X+kl_divergence_T+kl_divergence_XT
             kl_divergence_samples= kl_divergence_control + kl_divergence_ind
             kl_divergence = kl_divergence_factored + kl_divergence_samples
@@ -1264,22 +1278,8 @@ class FCR(nn.Module):
 
     def update_discriminator(self, outcomes, cf_outcomes_out,
                                 treatments, cf_treatments, covariates):
-        loss_tru = self.loss_discriminator(
-            self.discriminate(outcomes, treatments, covariates),
-            torch.ones(outcomes.size(0), device=outcomes.device)
-        )
-
-        loss_fls = self.loss_discriminator(
-            self.discriminate(cf_outcomes_out, cf_treatments, covariates),
-            torch.zeros(cf_outcomes_out.size(0), device=cf_outcomes_out.device)
-        )
-
-        loss = (loss_tru+loss_fls)/2.
-        self.optimizer_discriminator.zero_grad()
-        loss.backward()
-        self.optimizer_discriminator.step()
-
-        return loss.item()
+        """Legacy hook retained for API compatibility; discriminator updated elsewhere."""
+        return 0.0
     
     
 
@@ -1411,12 +1411,19 @@ class FCR(nn.Module):
             heads=2, final_act="relu"
         )
           
-    # def init_control_prior(self):
-    #     return MLP([self.covariate_dim]
-    #         + [self.hparams["encoder_width"]] * (self.hparams["encoder_depth"] - 1)
-    #         + [self.hparams["ZT_dim"]],
-    #         heads=2, final_act="relu"
-    #     )
+    def init_encoder_control(self):
+        return MLP([self.outcome_dim+self.covariate_dim]
+            + [self.hparams["encoder_width"]] * (self.hparams["encoder_depth"] - 1)
+            + [self.hparams["latent_exp_dim"]],
+            heads=2, final_act="relu"
+        )
+
+    def init_control_prior(self):
+        return MLP([self.covariate_dim]
+            + [self.hparams["encoder_width"]] * (self.hparams["encoder_depth"] - 1)
+            + [self.hparams["latent_exp_dim"]],
+            heads=2, final_act="relu"
+        )
 
     def init_decoder(self):
         if self.dist_outcomes == "nb":
@@ -1436,23 +1443,25 @@ class FCR(nn.Module):
             heads=heads
         )
     
-#     def init_decoder_control(self):
-#         if self.dist_outcomes == "nb":
-#             heads = 2
-#         elif self.dist_outcomes == "zinb":
-#             heads = 3
-#         elif self.dist_outcomes == "normal":
-#             heads = 2
-#         elif self.dist_outcomes == "bernoulli":
-#             heads = 1
-#         else:
-#             raise ValueError("dist_outcomes not recognized")
+    def init_decoder_control(self):
+        if self.dist_outcomes == "nb":
+            heads = 2
+        elif self.dist_outcomes == "zinb":
+            heads = 3
+        elif self.dist_outcomes == "normal":
+            heads = 2
+        elif self.dist_outcomes == "bernoulli":
+            heads = 1
+        else:
+            raise ValueError("dist_outcomes not recognized")
 
-#         return MLP([self.hparams["latent_dim"]]
-#             + [self.hparams["decoder_width"]] * (self.hparams["decoder_depth"] - 1)
-#             + [self.num_outcomes],
-#             heads=heads
-#         )
+        # Control decoder consumes the concatenated control latent (ZX+ZXT+ZT)
+        # which matches latent_exp_dim rather than latent_dim.
+        return MLP([self.hparams["latent_exp_dim"]]
+            + [self.hparams["decoder_width"]] * (self.hparams["decoder_depth"] - 1)
+            + [self.num_outcomes],
+            heads=heads
+        )
     
     
     def init_decoder_experiments(self):
@@ -1481,11 +1490,12 @@ class FCR(nn.Module):
         )
     
     
-    def init_decoder_interv(self):
-        return MLP([1]
-            + [self.num_treatments],
-            heads=1, final_act= "softmax"
-        )
+    # NOTE: Duplicate definition of init_decoder_interv existed below; keeping the later one.
+    # def init_decoder_interv(self):
+    #     return MLP([1]
+    #         + [self.num_treatments],
+    #         heads=1, final_act= "softmax"
+    #     )
     
 #     def init_decoder_interv_element(self):
 #         return MLP([self.hparams["ZT_dim"]]
@@ -1558,15 +1568,7 @@ class FCR(nn.Module):
         self.device = device
         self.to(self.device)
 
-    @classmethod
-    def defaults(self):
-        """
-        Returns the list of default hyper-parameters for FCR
-        """
-
-        return self._set_hparams_(self, "")
-
-    
+    # BUG: defaults() invalid; please pass hparams explicitly via load_FCR
     @torch.no_grad()
     def get_latent(self, outcomes, treatments, covariates):
         
@@ -1597,18 +1599,26 @@ class FCR(nn.Module):
             
             return ZX, ZXT, ZT
         else:
-            ZX, ZXT, ZT = self.get_latent(
-                outcomes, treatments, covariates
+            # FIXED BY MARINA - Proper sampling without double resampling
+            exp_constr = self.encode_exp(outcomes, covariates, treatments)
+            exp_dist = self.distributionize(
+                exp_constr, dim=self.hparams["latent_exp_dim"], dist="normal"
             )
-            ## modified: ??? how does this double resampling even make sense?
-            ZX_resample = self.sample_latent(ZX[0], torch.ones(ZX[1].shape, device=self.device))
-            ZXT_resample = self.sample_latent(ZXT[0], torch.ones(ZXT[1].shape, device=self.device))
-            ZT_resample = self.sample_latent(ZT[0], torch.ones(ZT[1].shape, device=self.device))
-            return ZX_resample,ZXT_resample, ZT_resample
             
+            # Extract mean and stddev for each latent component
+            ZX_mean = exp_dist.mean[:, :self.ZX_dim]
+            ZX_stddev = exp_dist.stddev[:, :self.ZX_dim]
+            ZXT_mean = exp_dist.mean[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]
+            ZXT_stddev = exp_dist.stddev[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]
+            ZT_mean = exp_dist.mean[:, self.ZX_dim+self.ZXT_dim:]
+            ZT_stddev = exp_dist.stddev[:, self.ZX_dim+self.ZXT_dim:]
             
+            # Sample once from the proper distributions (not double sampling)
+            ZX_sample = self.sample_latent(ZX_mean, ZX_stddev)
+            ZXT_sample = self.sample_latent(ZXT_mean, ZXT_stddev)
+            ZT_sample = self.sample_latent(ZT_mean, ZT_stddev)
             
-    
+            return ZX_sample, ZXT_sample, ZT_sample
     
     
     @torch.no_grad()
@@ -1645,7 +1655,7 @@ class FCR(nn.Module):
         
         control_latent_constr = self.encode_control(outcomes, covariates)
         control_latents_dist = self.distributionize(
-            control_latent_constr, dim=self.hparams["latent_dim"], dist="normal"
+            control_latent_constr, dim=self.hparams["latent_exp_dim"], dist="normal"
         )
         return control_latents_dist.rsample()
     
