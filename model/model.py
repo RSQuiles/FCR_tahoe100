@@ -12,7 +12,7 @@ from .module import (
 )
 import torch.nn.utils as nn_utils
 
-from utils.math_utils import (
+from ..utils.math_utils import (
     logprob_normal, kldiv_normal,
     kldiv_normal_marginal,
     logprob_bernoulli_logits,
@@ -47,7 +47,7 @@ def load_FCR(args, state_dict=None):
         omega0=args["omega0"],
         omega1=args["omega1"],
         omega2=args["omega2"],
-        omega3=args.get("omega3", 1.0),
+        omega3=args.get("omega3", 5.0),
         dist_mode=args["dist_mode"],
         dist_outcomes=args["dist_outcomes"],
         patience=args["patience"],
@@ -74,13 +74,12 @@ class FCR(nn.Module):
         num_covariates,
         batch_size, ## modified: added argument
         embed_outcomes=True,
-        
         embed_treatments=False,
         embed_covariates=True,
         omega0=1.0,
         omega1=2.0,
         omega2=2.0,
-        omega3=1.0,
+        omega3=5.0,
         dist_mode="match",
         dist_outcomes="normal",
         type_treatments=None,
@@ -89,7 +88,7 @@ class FCR(nn.Module):
         best_score=-1e3,
         patience=5,
         distance="element",
-        device="cpu",
+        device="cuda",
         hparams="",
     ):
         super(FCR, self).__init__()
@@ -619,8 +618,9 @@ class FCR(nn.Module):
     
     def permutation_distribution_X(self, mu, sigma, conditions):
         sample1 = self.sample_latent(mu, sigma, size=1)
+        # Returns list of average latent means for each unique condition:
         sample1 = marginalize_latent(sample1, conditions)
-        ZX1 = sample1[:, :self.ZX_dim]
+        ZX1 = sample1[:, :self.ZX_dim] # subsets to ZX part of the latent
         ZXT1 = sample1[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]
         label1 = torch.ones(sample1.shape[0], device=self.device, dtype=torch.float32).unsqueeze(1)
         original = torch.cat([ZX1, ZXT1, label1], -1)
@@ -849,6 +849,7 @@ class FCR(nn.Module):
 
         return (logprob.sum(0)/num).mean()
 
+    ## LEGACY CODE: not used in current implementation
     def loss(self, outcomes, outcomes_dist_samp,
             cf_outcomes, cf_outcomes_out,
             latents_dist, cf_latents_dist,
@@ -911,39 +912,38 @@ class FCR(nn.Module):
         """
         Compute losses.
         """
-        # (1) individual-specific likelihood
         # indiv_spec_nllh = -outcomes_dist_samp.log_prob(
         #     outcomes.repeat(self.mc_sample_size, *[1]*(outcomes.dim()-1))
         # ).mean()
         
-        ## control likelihood
-    
+        # 1) Likelihood for control outcomes
         indiv_spec_nllh_control = -control_outcomes_dist_samp.log_prob(
             control_outcomes.repeat(self.mc_sample_size, *[1]*(control_outcomes.dim()-1))
         ).mean()
             
-        ## experiments likelihood
+        # 2) Likelihood for treated outcomes
+
         # print("expr_outcomes_dist_samp mean shape is {}".format(expr_outcomes_dist_samp.mean.shape))
         # print("expr_outcomes shape is {}".format(expr_outcomes.shape))
         indiv_spec_nllh_experiments = -expr_outcomes_dist_samp.log_prob(
             expr_outcomes.repeat(self.mc_sample_size, *[1]*(expr_outcomes.dim()-1))
         ).mean()
             
-        # covariate cross-entropy loss 
+        # 3) Reconstruction loss of covariates from ZX 
         cross_entropy_loss = nn.CrossEntropyLoss()
         cov_loss = 0.0
         for i in range(len(covariates)):
             cov_loss = cov_loss + cross_entropy_loss(cov_constr[...,i],covariates[i].squeeze())
     
+        # 4) Reconstruction loss of treatments from (ZTs, ZTs_control)
         treatment_loss = cross_entropy_loss(treatment_constr.squeeze(),torch.argmax(treatments, 1))
 
-        # (3) kl divergence
-        
-        ## individual KL divergence with the joint distribution
-        ## KL(q(zt,zxt,zx| y, x, t))
+        # KL divergences:
+
         agg_prior = aggregate_normal_distr([ZX_prior_dist.mean, ZXT_prior_dist.mean, ZT_prior_dist.mean],\
                                            [ZX_prior_dist.stddev, ZXT_prior_dist.stddev, ZT_prior_dist.stddev] )
         
+        # 5) KL divergence between treated posterior and prior
         kl_divergence_ind =  kldiv_normal(
             agg_prior[0],
             agg_prior[1],
@@ -951,18 +951,29 @@ class FCR(nn.Module):
             exp_dist.stddev,
         )
         
-        ## marginalized distributionn KL divergence
+        ## 6) KL divergence for marginalized distributions
+        """
+        This code is computing a group-wise (marginalized) KL divergence over conditions (covariate + treatment)
+        It enforces the model to align the condition-level posterior with the condition-level prior, 
+        i.e. make latent representations for a given condition coherent.
+        """
         ## ZX divergence
-        # print("ZX_prior_dist.mean shape {}, ZX mean shape {}".format(ZX_prior_dist.mean.shape, ZX_dist[0].shape))
-        covariates = torch.cat(covariates, dim=1)
-        conditions = torch.cat((treatments, covariates), dim=1)
+        covariates = torch.cat(covariates, dim=1) # Turn list of tensors into tensor, where each row is the covariates of the sample
+        conditions = torch.cat((treatments, covariates), dim=1) # Covariate - Treatment (condition) combination for each sample
         conditions_labels = torch.unique(conditions, dim=0)
+
+        """
+        marginalize_latent_tx returns a tuple:
+        - cond_mean: average mean vector (for latent ZX) for each unique condition
+        - cond_stddev: average stddev vector (for latent ZX) for each unique condition
+        """
         marginal_ZX_prior =  marginalize_latent_tx(ZX_prior_dist.mean, ZX_prior_dist.stddev, conditions)
         ## modified: index as ZX_dist[...,0/1] to get last dimension, instead of ZX_dist[0/1]
         #print("ZX_dist: ", ZX_dist.shape)
         marginal_ZX = marginalize_latent_tx(ZX_dist[...,0], ZX_dist[...,1], conditions)
         kl_divergence_X = torch.tensor(0, dtype=torch.float64, device=self.device)
-        # print("marginal_ZX_prior device {}, ZX device {}".format(marginal_ZX_prior.device(), marginal_ZX.device()))
+
+        # Sum over KL divergences for all conditions
         for i in range(conditions_labels.shape[0]):
             kl_divergence_X +=kldiv_normal(
             marginal_ZX_prior[0][i],
@@ -973,6 +984,7 @@ class FCR(nn.Module):
         
       
         ## ZT divergence
+        # We apply the same rationale as above, but for ZT latent
         marginal_ZT_prior =  marginalize_latent_tx(ZT_prior_dist.mean, ZT_prior_dist.stddev, conditions)
         ## modified: index as ZX_dist[...,0/1] to get last dimension, instead of ZX_dist[0/1]
         marginal_ZT = marginalize_latent_tx(ZT_dist[...,0], ZT_dist[...,1], conditions)
@@ -985,8 +997,8 @@ class FCR(nn.Module):
             marginal_ZT[1][i]        
             )
         
-        ### Z_XT divergence
-    
+        ## Z_XT divergence
+        # We apply the same rationale as above, but for ZXT latent
         marginal_ZXT_prior =  marginalize_latent_tx(ZXT_prior_dist.mean, ZXT_prior_dist.stddev, conditions)
         ## modified: index as ZX_dist[...,0/1] to get last dimension, instead of ZX_dist[0/1]
         marginal_ZXT = marginalize_latent_tx(ZXT_dist[...,0], ZXT_dist[...,1], conditions)
@@ -999,7 +1011,7 @@ class FCR(nn.Module):
             marginal_ZXT[1][i]        
             )
         
-        ## control divergence
+        # 7) KL divergence between control posterior and prior
         kl_divergence_control = kldiv_normal(
             control_prior_dist[0],
             control_prior_dist[1],
@@ -1016,39 +1028,39 @@ class FCR(nn.Module):
         """
         Execute the workflow.
         """
-        
-        ## esitimation latents for controls
-        # q(z_control | y_control, x)
+        # POSTERIORS:
+        # q(zx_control | y_control, x)
         control_treatment = torch.zeros(treatments.shape, dtype=torch.float32, device=treatments.device)
         ZX_control_constr = self.encode_ZX(control_outcomes, covariates)
         ZX_control_dist = self.distributionize(
             ZX_control_constr, dim=self.hparams["ZX_dim"], dist="normal"
         )
         
-        ## q(z_t| y, T)
+        # q(zt_control | y_control, T_control)
         ZT_control_constr = self.encode_ZT(control_outcomes, control_treatment)
         ZT_control_dist = self.distributionize(
             ZT_control_constr, dim=self.hparams["ZT_dim"], dist="normal"
         )
         
+        # q(zxt_control | y_control, T_control, x)
         ZXT_control_constr = self.encode_ZXT(control_outcomes, covariates, control_treatment)
         ZXT_control_dist = self.distributionize(
             ZXT_control_constr, dim=self.hparams["ZXT_dim"], dist="normal"
         )
-        ## estimation latents for experiments
         
-        
+        # q(zx| y, x)
         ZX_constr = self.encode_ZX(outcomes, covariates)
         ZX_dist = self.distributionize(
             ZX_constr, dim=self.hparams["ZX_dim"], dist="normal"
         )
         
-        ## q(z_t| y, T)
+        # q(zt| y, T)
         ZT_constr = self.encode_ZT(outcomes, treatments)
         ZT_dist = self.distributionize(
             ZT_constr, dim=self.hparams["ZT_dim"], dist="normal"
         )
         
+        # q(zxt| y, T, x)
         ZXT_constr = self.encode_ZXT(outcomes, covariates, treatments)
         ZXT_dist = self.distributionize(
             ZXT_constr, dim=self.hparams["ZXT_dim"], dist="normal"
@@ -1060,53 +1072,56 @@ class FCR(nn.Module):
         sim_x = F.cosine_similarity(ZX_constr[..., 0], ZX_control_constr[..., 0], dim=1).mean()
         sim_loss = sim_t - sim_x
 
-        
+        # PRIORS:
+        # p(zt_control| T_control) prior
         ZT_control_prior = self.encode_ZT_prior(control_treatment)
         ZT_control_prior_dist = self.distributionize(
             ZT_control_prior, dim=self.hparams["ZT_dim"], dist="normal"
         )
         
-        ## p(z_xt|x,t) prior
+        # p(zxt_control| x,T_control) prior
         ZXT_control_prior = self.encode_ZXT_prior(covariates, control_treatment)
         ZXT_control_prior_dist = self.distributionize(
             ZXT_control_prior, dim=self.hparams["ZXT_dim"], dist="normal"
         )
         
         
-        ## p(z_x|x) prior
+        # p(zx| x) prior
         ZX_constr_prior = self.encode_ZX_prior(covariates)
         ZX_prior_dist = self.distributionize(
             ZX_constr_prior, dim=self.hparams["ZX_dim"], dist="normal"
         )
 
-        ## p(z_t|t) prior
+        # p(zt| t) prior
         ZT_constr_prior = self.encode_ZT_prior(treatments)
         ZT_prior_dist = self.distributionize(
             ZT_constr_prior, dim=self.hparams["ZT_dim"], dist="normal"
         )
         
-        ## p(z_xt|x,t) prior
+        # p(zxt| x,t) prior
         ZXT_constr_prior = self.encode_ZXT_prior(covariates, treatments)
         ZXT_prior_dist = self.distributionize(
             ZXT_constr_prior, dim=self.hparams["ZXT_dim"], dist="normal"
         )
         
+        # NOTE: no need of ZX_control_prior, as it the same as ZX_prior
         control_prior_dist = aggregate_normal_distr([ZX_prior_dist.mean, ZXT_control_prior_dist.mean, ZT_control_prior_dist.mean],\
                                                    [ZX_prior_dist.stddev, ZXT_control_prior_dist.stddev, ZT_control_prior_dist.stddev])
 
 
-        ## We now sample the generated distributions
+        # Sampling the generated (posterior) latent distributions:
         
         ## p(x|ZX)
         ## modified: use ZX_constr[...,0] instead of ZX_constr[0] to correctly get the mus and sigmas (see how MLP.forward reshapes)
         ZX_resample = self.sample_latent(ZX_constr[...,0], ZX_constr[...,1])
         #print(ZX_constr[...,0].shape)
         #print(ZX_constr[...,1].shape)
+
+        # Reconstruct covariates from latent
         cov_inputs = ZX_resample
         #print("cov_inputs shape:", cov_inputs.shape)
         cov_constr = self.covariate_decode(cov_inputs)
 
-        
         ## modified: use ZK_k[...,0/1] instead of [0/1] for the same reasons as above
         ZT_resample = self.sample_latent(ZT_constr[...,0], ZT_constr[...,1])
         ZXT_resample = self.sample_latent(ZXT_constr[...,0], ZXT_constr[...,1])
@@ -1114,7 +1129,11 @@ class FCR(nn.Module):
         ZT_control_resample = self.sample_latent(ZT_control_constr[...,0], ZT_control_constr[...,1])
         ZXT_control_resample = self.sample_latent(ZXT_control_constr[...,0], ZXT_control_constr[...,1])
         ZTs_control = torch.cat([ZT_control_resample, ZXT_control_resample], dim=1)
+
+        # Reconstruct treatment from latent
         treatment_constr = self.intervention_decode(ZTs, ZTs_control)
+
+        # GENERATE (ZX, ZXT, ZT) (POSTERIOR) LATENT DISTRIBUTIONS:
 
         ## modified: had ZT_control_dist.mean and ZT_control_stddev twice when concatenating the latents
         control_latents_dist_mean = torch.cat([ZX_control_dist.mean, ZXT_control_dist.mean, ZT_control_dist.mean], dim=1)
@@ -1146,17 +1165,17 @@ class FCR(nn.Module):
         expr_outcomes_dist_samp = self.distributionize(expr_outcomes_constr_samp)
 
         results = [
-            control_outcomes_dist_samp,
-            expr_outcomes_dist_samp,
-            exp_dist,
+            control_outcomes_dist_samp, # distribution for control outcomes
+            expr_outcomes_dist_samp,    # distribution for treated outcomes
+            exp_dist,                   # distribution for treated latents
             ZX_constr,
             ZT_constr,
             ZXT_constr,
             ZX_prior_dist,
             ZT_prior_dist,
             ZXT_prior_dist,
-            control_latents_dist,
-            control_prior_dist,
+            control_latents_dist,       # distribution for control latents
+            control_prior_dist,         # prior distribution for control latents
             cov_constr,
             treatment_constr,
             sim_loss,
@@ -1204,13 +1223,13 @@ class FCR(nn.Module):
 
             indiv_spec_nllh = indiv_spec_nllh_control + indiv_spec_nllh_experiments
             # Include causal structure regularizer
-            covar_spec_nllh = treatment_loss + cov_loss + sim_loss
-            kl_divergence_factored = kl_divergence_X+kl_divergence_T+kl_divergence_XT
+            covar_spec_loss = treatment_loss + cov_loss + sim_loss
+            kl_divergence_factored = kl_divergence_X + kl_divergence_T + kl_divergence_XT
             kl_divergence_samples= kl_divergence_control + kl_divergence_ind
             kl_divergence = kl_divergence_factored + kl_divergence_samples
 
             loss = (self.omega0 * indiv_spec_nllh
-                + self.omega1 * covar_spec_nllh
+                + self.omega1 * covar_spec_loss
                 + self.omega2 * kl_divergence_samples
                 + self.omega2 * kl_divergence_factored
                 -  self.omega3 * permute_loss   
@@ -1229,9 +1248,10 @@ class FCR(nn.Module):
             
             return {
                 "Indiv-spec NLLH": indiv_spec_nllh.item(),
-                "Covar-spec NLLH": covar_spec_nllh.item(),
+                "Covar-spec NLLH": covar_spec_loss.item(),
                 "KL Divergence": kl_divergence.item(),
-                "Discriminator": permute_loss.item()
+                "Discriminator": permute_loss.item(),
+                "Loss":loss.item()
             }
             
         else:
@@ -1256,7 +1276,7 @@ class FCR(nn.Module):
             
             indiv_spec_nllh = indiv_spec_nllh_control + indiv_spec_nllh_experiments
             # Include causal structure regularizer
-            covar_spec_nllh = treatment_loss + cov_loss + sim_loss
+            covar_spec_loss = treatment_loss + cov_loss + sim_loss
             kl_divergence_factored = kl_divergence_X+kl_divergence_T+kl_divergence_XT
             kl_divergence_samples= kl_divergence_control + kl_divergence_ind
             kl_divergence = kl_divergence_factored + kl_divergence_samples
@@ -1265,15 +1285,23 @@ class FCR(nn.Module):
             permute_X_loss = self.loss_discriminator_X(permute_X_pred, perturb_X[:, -1])
             permute_loss =  0.5 * (permute_T_loss + permute_X_loss)
             self.optimizer_discriminator.zero_grad()
-            permute_loss.backward()
+            permute_loss.backward() # Use only permute_loss to update gradients
             self.optimizer_discriminator.step()
-
+            
+            # Compute for logging purposes
+            loss = (self.omega0 * indiv_spec_nllh
+                + self.omega1 * covar_spec_loss
+                + self.omega2 * kl_divergence_samples
+                + self.omega2 * kl_divergence_factored
+                -  self.omega3 * permute_loss   
+            )
 
             return {
                 "Indiv-spec NLLH": indiv_spec_nllh.item(),
-                "Covar-spec NLLH": covar_spec_nllh.item(),
+                "Covar-spec NLLH": covar_spec_loss.item(),
                 "KL Divergence": kl_divergence.item(),
-                "Discriminator": permute_loss.item()
+                "Discriminator": permute_loss.item(),
+                "Loss": loss.item()
             }
 
     def update_discriminator(self, outcomes, cf_outcomes_out,
@@ -1348,12 +1376,15 @@ class FCR(nn.Module):
                     ))
         return covariates_emb
 
+    # Legacy code: latent_dim is deprecated
+    """
     def init_encoder(self):
         return MLP([self.outcome_dim+self.treatment_dim+self.covariate_dim]
             + [self.hparams["encoder_width"]] * (self.hparams["encoder_depth"] - 1)
             + [self.hparams["latent_dim"]],
             heads=2, final_act="relu"
         )
+    """
     
    
       
@@ -1425,6 +1456,8 @@ class FCR(nn.Module):
             heads=2, final_act="relu"
         )
 
+    # Legacy code: latent_dim is deprecated
+    """
     def init_decoder(self):
         if self.dist_outcomes == "nb":
             heads = 2
@@ -1442,6 +1475,7 @@ class FCR(nn.Module):
             + [self.num_outcomes],
             heads=heads
         )
+    """
     
     def init_decoder_control(self):
         if self.dist_outcomes == "nb":

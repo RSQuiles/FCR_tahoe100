@@ -294,9 +294,8 @@ class SubDataset:
 
     def __len__(self):
         return len(self.genes)
-    
 
-    
+ 
 class SubDataset_Pair:
     """
     Subsets a `Dataset` by selecting the examples given by `indices`.

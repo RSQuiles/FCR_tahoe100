@@ -3,6 +3,7 @@ import time
 import logging
 from datetime import datetime
 from collections import defaultdict
+import wandb
 
 import numpy as np
 
@@ -129,110 +130,137 @@ def train(args, prepare=prepare, state_dict=None):
     if args["seed"] is not None:
         np.random.seed(args["seed"])
         torch.manual_seed(args["seed"])
+
+    # Setup WandB logging
+    with wandb.init(config=args, project=args["name"], name=args["experiment"]) as run:
     
-    if state_dict!=None:
-        model, datasets = prepare(args, state_dict)  
-    else:
-        model, datasets = prepare(args)
-
-    dt = datetime.now().strftime("%Y.%m.%d_%H:%M:%S")
-    writer = SummaryWriter(log_dir=os.path.join(args["artifact_path"], "runs/" + args["name"] + "_" + dt))
-    save_dir = os.path.join(args["artifact_path"], "saves/" + args["name"] + "_" + dt)
-    os.makedirs(save_dir, exist_ok=True)
-
-    initialize_logger(save_dir)
-    ljson({"training_args": args})
-    ljson({"model_params": model.hparams})
-    logging.info("")
-
-    start_time = time.time()
-    for epoch in range(args["max_epochs"]):
-        
-        epoch_training_stats = defaultdict(float)
-        if epoch % args["adv_epoch"]==0:
-            adv_training=True
+        if state_dict!=None:
+            model, datasets = prepare(args, state_dict)  
         else:
-            adv_training=False
-        # print("Adversarial Training {}".format(adv_training))
+            model, datasets = prepare(args)
+        
+        # WandB tracking
+        run.watch(model, log_freq=10)
 
-        minibatch_counter = 0
-        for data in datasets["loader_tr"]:
+        dt = datetime.now().strftime("%Y.%m.%d_%H:%M:%S")
+        writer = SummaryWriter(log_dir=os.path.join(args["artifact_path"], "runs/" + args["name"] + "_" + dt))
+        save_dir = os.path.join(args["artifact_path"], "saves/" + args["name"] + "_" + dt)
+        os.makedirs(save_dir, exist_ok=True)
 
-            # print("Training with minibatch ", minibatch_counter)
-            (experiment, treatment, control, _, covariates)= \
-            (data[0], data[1], data[2], data[3], data[4:])
-          
-            # training without divergence
-            minibatch_training_stats = model.update(
-                experiment, treatment, control, covariates, adv_training
-            )
+        initialize_logger(save_dir)
+        ljson({"training_args": args})
+        ljson({"model_params": model.hparams})
+        logging.info("")
+
+        start_time = time.time()
+        for epoch in range(args["max_epochs"]):
             
-            minibatch_counter += 1
-            
-            ## training with divergence
-            # minibatch_training_stats = model.update_divergence(
-            #     experiment, treatment, control, covariates, adv_training)
+            epoch_training_stats = defaultdict(float)
+            if epoch % args["adv_epoch"]==0:
+                adv_training=True
+            else:
+                adv_training=False
+            # print("Adversarial Training {}".format(adv_training))
 
-            for key, val in minibatch_training_stats.items():
-                epoch_training_stats[key] += val
-        model.update_eval_encoder()
+            minibatch_counter = 0
+            for data in datasets["loader_tr"]:
 
-        for key, val in epoch_training_stats.items():
-            epoch_training_stats[key] = val / len(datasets["loader_tr"])
-            if not (key in model.history.keys()):
-                model.history[key] = []
-            model.history[key].append(epoch_training_stats[key])
-        model.history["epoch"].append(epoch)
+                # print("Training with minibatch ", minibatch_counter)
+                (experiment, treatment, control, _, covariates)= \
+                (data[0], data[1], data[2], data[3], data[4:])
 
-        ellapsed_minutes = (time.time() - start_time) / 60
-        model.history["elapsed_time_min"] = ellapsed_minutes
+                # Check dimensions of inputs
+                # print("Experiment dimensions: ", experiment.shape)
+                # print("Treatment dimensions: ", treatment.shape)
+                # print("Control dimensions: ", control.shape)
+                # print("Covariates dimensions: ", [cov.shape for cov in covariates])
 
-        # decay learning rate if necessary
-        # also check stopping condition: 
-        # patience ran out OR max epochs reached
-        stop = (epoch == args["max_epochs"] - 1)
+                minibatch_training_stats = model.update(
+                    experiment, treatment, control, covariates, adv_training
+                )
+                
+                minibatch_counter += 1
+                
+                ## Legacy code for training with divergence 
+                # minibatch_training_stats = model.update_divergence(
+                #     experiment, treatment, control, covariates, adv_training)
 
-        ## NOTE: can we use evaluate and evaluate prediction alternatively?
-        if (epoch % args["checkpoint_freq"]) == 0 or stop:
-            evaluation_stats = evaluate_prediction(model, datasets)
-            for key, val in evaluation_stats.items():
-                if not (key in model.history.keys()):
-                    model.history[key] = []
-                model.history[key].append(val)
-            model.history["stats_epoch"].append(epoch)
-
-            ljson(
-                {
-                    "epoch": epoch,
-                    "training_stats": epoch_training_stats,
-                    "evaluation_stats": evaluation_stats,
-                    "ellapsed_minutes": ellapsed_minutes,
-                    "Discriminator Training": adv_training
-                }
-            )
+                for key, val in minibatch_training_stats.items():
+                    epoch_training_stats[key] += val
+            model.update_eval_encoder()
 
             for key, val in epoch_training_stats.items():
-                writer.add_scalar(key, val, epoch)
+                epoch_training_stats[key] = val / len(datasets["loader_tr"])
+                if not (key in model.history.keys()):
+                    model.history[key] = []
+                model.history[key].append(epoch_training_stats[key])
+            model.history["epoch"].append(epoch)
 
-            torch.save(
-                (model.state_dict(), args, model.history),
-                os.path.join(
-                    save_dir,
-                    "model_seed={}_epoch={}.pt".format(args["seed"], epoch),
-                ),
-            )
+            ellapsed_minutes = (time.time() - start_time) / 60
+            model.history["elapsed_time_min"] = ellapsed_minutes
 
-            ljson(
-                {
-                    "model_saved": "model_seed={}_epoch={}.pt\n".format(
-                        args["seed"], epoch
-                    )
-                }
-            )
-            # stop = stop or model.early_stopping(np.mean(evaluation_stats["test"]))
-            if stop:
-                ljson({"early_stop": epoch})
-                break
+            # decay learning rate if necessary
+            # also check stopping condition: 
+            # patience ran out OR max epochs reached
+            stop = (epoch == args["max_epochs"] - 1)
 
-    writer.close()
-    return model
+            ## NOTE: can we use evaluate and evaluate prediction alternatively?
+            if (epoch % args["checkpoint_freq"]) == 0 or stop:
+                evaluation_stats = evaluate_prediction(model, datasets)
+                for key, val in evaluation_stats.items():
+                    if not (key in model.history.keys()):
+                        model.history[key] = []
+                    model.history[key].append(val)
+                model.history["stats_epoch"].append(epoch)
+
+                ljson(
+                    {
+                        "epoch": epoch,
+                        "training_stats": epoch_training_stats,
+                        "evaluation_stats": evaluation_stats,
+                        "ellapsed_minutes": ellapsed_minutes,
+                        "Discriminator Training": adv_training
+                    }
+                )
+
+                # Log stats to WandB
+                all_stats = {}
+                for stat, value in epoch_training_stats.items():
+                    all_stats[stat] = value
+                
+                for stat, value in evaluation_stats.items():
+                    all_stats[stat] = value
+
+                all_stats["ellapsed_minutes"] = ellapsed_minutes
+                all_stats["R2 Score Train (Mean)"] = evaluation_stats["train"][0]
+                all_stats["R2 Score Train (Stddev)"] = evaluation_stats["train"][1]
+                all_stats["R2 Score Test (Mean)"] = evaluation_stats["test"][0]
+                all_stats["R2 Score Test (Stddev)"] = evaluation_stats["test"][1]
+
+                run.log(all_stats)
+
+                for key, val in epoch_training_stats.items():
+                    writer.add_scalar(key, val, epoch)
+
+                torch.save(
+                    (model.state_dict(), args, model.history),
+                    os.path.join(
+                        save_dir,
+                        "model_seed={}_epoch={}.pt".format(args["seed"], epoch),
+                    ),
+                )
+
+                ljson(
+                    {
+                        "model_saved": "model_seed={}_epoch={}.pt\n".format(
+                            args["seed"], epoch
+                        )
+                    }
+                )
+                # stop = stop or model.early_stopping(np.mean(evaluation_stats["test"]))
+                if stop:
+                    ljson({"early_stop": epoch})
+                    break
+
+        writer.close()
+        return model
