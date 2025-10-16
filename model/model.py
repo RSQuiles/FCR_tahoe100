@@ -54,8 +54,9 @@ def load_FCR(args, state_dict=None):
         device=device,
         distance=args['distance'],
         hparams=args["hparams"],
-        ## modified: added batch size
-        batch_size=args["batch_size"]
+        ## modified: added batch size and sweep
+        batch_size=args["batch_size"],
+        sweep=args["sweep"]
     )
     if state_dict is not None:
         model.load_state_dict(state_dict)
@@ -73,6 +74,7 @@ class FCR(nn.Module):
         num_treatments,
         num_covariates,
         batch_size, ## modified: added argument
+        sweep,
         embed_outcomes=True,
         embed_treatments=False,
         embed_covariates=True,
@@ -115,6 +117,8 @@ class FCR(nn.Module):
         self.patience = patience
         self.patience_trials = 0
         self.distance = distance
+        # hyperparameter sweep
+        self.sweep = sweep
         # set hyperparameters
         self._set_hparams_(hparams)
 
@@ -137,8 +141,6 @@ class FCR(nn.Module):
         """
 
         self.hparams = {
-            "latent_dim": 64,
-            "latent_exp_dim":192,
             "ZX_dim": 64,
             "ZT_dim":64,
             "ZXT_dim":64,            
@@ -166,6 +168,9 @@ class FCR(nn.Module):
                 self.hparams.update(dictionary)
             else:
                 self.hparams.update(hparams)
+
+        ## modified: compute latent_exp_dim dynamically
+        self.hparams["latent_exp_dim"] = self.hparams["ZX_dim"] + self.hparams["ZT_dim"] + self.hparams["ZXT_dim"]
 
         self.outcome_dim = (
             self.hparams["outcome_emb_dim"] if self.embed_outcomes else self.num_outcomes)
@@ -1205,9 +1210,14 @@ class FCR(nn.Module):
                            ZX, ZT, ZXT, ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_prior_dist, control_latents_dist,
                            cov_constr, treatment_constr, treatments,covariates)
 
-        
-            perturb_X = self.permutation_distribution_X(exp_dist.mean, exp_dist.stddev,conditions)
-            perturb_T = self.permutation_distribution_T(exp_dist.mean, exp_dist.stddev,conditions)
+            #print("Conditions tensor: ", conditions)
+            # NEW: separate conditions into treatment and covariate conditions for discriminator
+            cov_conditions = covariates = torch.cat(covariates, dim=1)
+            #print("Covariate conditions: ", cov_conditions)
+            #print("Treatment conditions:", treatments)
+
+            perturb_X = self.permutation_distribution_X(exp_dist.mean, exp_dist.stddev,cov_conditions)
+            perturb_T = self.permutation_distribution_T(exp_dist.mean, exp_dist.stddev,treatments)
             # BUGFIX: using torch.no_grad() here blocks gradients to encoders; we need gradients.
             # Freeze discriminator params but keep graph for inputs.
             for p in self.discriminator_T.parameters():
@@ -1266,9 +1276,11 @@ class FCR(nn.Module):
                            ZX, ZT, ZXT, ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_prior_dist, control_latents_dist,
                            cov_constr, treatment_constr, treatments,covariates)
 
-                
-            perturb_X = self.permutation_distribution_X(exp_dist.mean, exp_dist.stddev, conditions)
-            perturb_T = self.permutation_distribution_T(exp_dist.mean, exp_dist.stddev, conditions)
+            # NEW: separate conditions into treatment and covariate conditions for discriminator
+            cov_conditions = covariates = torch.cat(covariates, dim=1)
+
+            perturb_X = self.permutation_distribution_X(exp_dist.mean, exp_dist.stddev, cov_conditions)
+            perturb_T = self.permutation_distribution_T(exp_dist.mean, exp_dist.stddev, treatments)
             # print("perturb_T shape is {}".format(perturb_T[:,:-1].shape))
             permute_T_pred = self.discriminate_T(perturb_T[:, :-1])
             permute_X_pred = self.discriminate_X(perturb_X[:, :-1])

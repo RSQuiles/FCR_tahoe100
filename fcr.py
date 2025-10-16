@@ -19,8 +19,28 @@ import argparse
 
 """
 Fetch the latest model (path) given the directory where checkpoints are saved
+We can also specify a given epoch
 """
-def fetch_latest(directory, suffix=".pt"):
+def fetch_latest(directory, suffix=".pt", target_epoch=None):
+    if target_epoch is not None:
+        saves_dir = os.path.join(directory,"saves")
+        if not os.path.isdir(saves_dir):
+            raise FileNotFoundError(f"Directory not found: {saves_dir}")
+
+        # Retrieve all model checkpoints in the saves directory
+        ckpts = []    
+        for root, _, files in os.walk(saves_dir):
+            for f in files:
+                if f.endswith(suffix):
+                    ckpts.append(os.path.join(root, f))
+        # Get the chekpoint corresponding to the specified epoch
+        target_file = next((f for f in ckpts if f"epoch={target_epoch}.pt" in f), None)
+        if target_file is None:
+            raise FileNotFoundError(f"No checkpoint file found for epoch {target_epoch} in {saves_dir}")
+
+        return target_file
+
+    # If no epoch is specified, return the latest checkpoint
     saves_dir = os.path.join(directory,"saves")
     if not os.path.isdir(saves_dir):
         raise FileNotFoundError(f"Directory not found: {saves_dir}")
@@ -38,6 +58,21 @@ def fetch_latest(directory, suffix=".pt"):
     # Get the latest checkpoint
     latest_ckpt = max(ckpts, key=os.path.getmtime)
     return latest_ckpt # returns the string path of the latest checkpoint file
+
+def get_model(model_dir, target_epoch=None, dataset="all"):
+    # Get path to model checkpoint
+    model_path = fetch_latest(model_dir, target_epoch=target_epoch)
+
+    # LOAD ARGUMENTS
+    # Note: dataset_mode defines which dataset split will be in the loader
+    fcr_model = FCR_sim(model_path=model_path, dataset_mode=dataset)
+    args = fcr_model.arguments
+
+    # LOAD MODEL AND DATASETS
+    trained_model = fcr_model.model
+    datasets = fcr_model.dataset
+
+    return [args, trained_model, datasets]
 
 
 """
@@ -84,6 +119,10 @@ class FCR_sim:
         else:
             state_dict = torch.load(model_path)
             self.arguments = state_dict[1]
+            # Correct for arguments added in the future
+            if "sweep" not in self.arguments.keys():
+                self.arguments["sweep"] = False
+                
             self.model, self.dataset = prepare(self.arguments, state_dict[0], dataset)
     
     def train_fcr(self, state_dict=None):
