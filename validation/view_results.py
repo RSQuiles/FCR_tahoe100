@@ -11,6 +11,7 @@ import argparse
 import scanpy as sc
 import re
 import math
+import matplotlib.colors as mcolors
 
 def compute_latents(trained_model, datasets, adata):
     print("Computing latent representations...")
@@ -28,13 +29,13 @@ def compute_latents(trained_model, datasets, adata):
 
     ZXs = [e.detach().cpu().numpy() for e in ZXs]
     ZXs = np.array(ZXs)
-    print("ZX mean:", ZXs.mean(), "ZX std:", ZXs.std())
+    # print("ZX mean:", ZXs.mean(), "ZX std:", ZXs.std())
     ZXTs = [e.detach().cpu().numpy() for e in ZXTs]
     ZXTs = np.array(ZXTs)
-    print("ZXT mean:", ZXTs.mean(), "ZXT std:", ZXTs.std())
+    # print("ZXT mean:", ZXTs.mean(), "ZXT std:", ZXTs.std())
     ZTs = [e.detach().cpu().numpy() for e in ZTs]
     ZTs = np.array(ZTs)
-    print("ZT mean:", ZTs.mean(), "ZT std:", ZTs.std())
+    # print("ZT mean:", ZTs.mean(), "ZT std:", ZTs.std())
 
     # Append to adata
     adata.obsm["ZXs"] = ZXs
@@ -62,6 +63,8 @@ def raw_umap(adata,
     sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=30)
     sc.tl.umap(adata, min_dist=min_dist)
 
+    norm = mcolors.SymLogNorm(linthresh=0.01, vmin=0, vmax=5)
+
     # UMAP colored by feature
     figure = sc.pl.umap(
         adata,
@@ -71,9 +74,9 @@ def raw_umap(adata,
         size=size,
         outline_color="gray",
         outline_width=0.5,
-        legend_loc = "on data",
-        color_map="Blues",
-        vcenter=0.01,
+        legend_loc = "right margin",
+        #vcenter=0.01,
+        norm=norm,
         show=False,
         ax=ax,
         return_fig=return_fig
@@ -85,18 +88,20 @@ def umap(adata,
          rep,
          return_fig,
          ax=None,
-         n_neighbors=10,
-         metric="cosine", 
-         min_dist=0.05,   
+         n_neighbors=15,
+         metric="euclidean", 
+         min_dist=0.1,   
          size=10,
          color=["cell_name"],
          palette="Set3",
-         legend_loc="on data",
+         legend_loc="right margin",
          title=None
          ):
     
     sc.pp.neighbors(adata, use_rep=rep, n_neighbors=n_neighbors, metric=metric)
     sc.tl.umap(adata, min_dist=min_dist)
+
+    norm = mcolors.SymLogNorm(linthresh=0.01, vmin=0, vmax=5)
 
     figure = sc.pl.umap(
         adata,
@@ -108,16 +113,35 @@ def umap(adata,
         outline_color="gray",
         outline_width=0.5,
         legend_loc=legend_loc,
-        color_map="Blues",
         show=False,
         ax=ax,  # allows plotting into an existing axis
         return_fig=return_fig,  # Return if we are using ax = None
+        #vcenter=0.01,
+        norm=norm
     )
 
     return figure
 
 
-def plot_umaps(model_dir, target_epoch=None):
+def plot_umaps(model_dir, target_epoch=None, filter_dict=None):
+    """
+    Plot UMAPs for FCR latent representations.
+    
+    Parameters
+    ----------
+    model_dir : str
+        Path to model directory
+    target_epoch : int, optional
+        Specific epoch to load
+    filter_dict : dict, optional
+        Dictionary of filters to apply to adata before plotting.
+        Usage: mainly to select drugs if there are several
+        Format: {column_name: value} or {column_name: [list_of_values]}
+        Examples:
+            {'Agg_Treatment': 'Trametinib'}  # Only Trametinib samples
+            {'Agg_Treatment': ['Trametinib', 'Dabrafenib']}  # Multiple drugs
+            {'cell_name': 'A375', 'dose': 10}  # Multiple conditions
+    """
     from ..fcr import get_model
 
     args, model, datasets= get_model(model_dir, target_epoch)
@@ -125,39 +149,70 @@ def plot_umaps(model_dir, target_epoch=None):
     output_dir = str(os.path.join(model_dir, "umaps"))
     os.makedirs(output_dir, exist_ok=True)
 
-    ####################################################
-    ################# PLOT UMAP RESULTS ################
-    ####################################################
-
     adata = sc.read(args["data_path"])
 
     # Append latents to adata
     compute_latents(model, datasets, adata)
 
+    # Apply filters if provided
+    if filter_dict is not None:
+        mask = np.ones(adata.n_obs, dtype=bool)
+        filter_suffix = ""
+        
+        for key, value in filter_dict.items():
+            if key not in adata.obs.columns:
+                print(f"Warning: '{key}' not found in adata.obs. Skipping this filter.")
+                continue
+            
+            # Handle single value or list of values
+            if isinstance(value, (list, tuple)):
+                mask &= adata.obs[key].isin(value)
+                filter_suffix += f"_{'_'.join(str(v) for v in value)}"
+            else:
+                mask &= (adata.obs[key] == value)
+                filter_suffix += f"_{value}"
+        
+        # Subset adata
+        n_before = adata.n_obs
+        adata_sub = adata[mask].copy()
+        n_after = adata_sub.n_obs
+        print(f"Applied filters: {filter_dict}")
+        print(f"Samples: {n_before} → {n_after} ({n_after/n_before*100:.1f}%)")
+        
+        # Clean up suffix for filename
+        filter_suffix = filter_suffix.replace(" ", "_").replace("/", "_")[:50]
+    else:
+        filter_suffix = ""
+        adata_sub = adata
+
     # Plot ZX
     print("Plotting ZX UMAP...")
-    fig = umap(adata, rep="ZXs", return_fig=True)
+    fig = umap(adata, rep="ZXs", color=["cell_name"], return_fig=True)
     fig.savefig(os.path.join(output_dir,"UMAP_ZXs.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
     # PLot ZXT
     print("Plotting ZXT UMAP...")
-    fig = umap(adata, rep="ZXTs", color=["cell_name", "Agg_Treatment"], return_fig=True)
-    fig.savefig(os.path.join(output_dir,"UMAP_ZXTs.png"), dpi=300, bbox_inches="tight")
+    fig = umap(adata, rep="ZXTs", color=["cell_name", "dose", "Agg_Treatment"], return_fig=True)
+    fig.savefig(os.path.join(output_dir,f"UMAP_ZXTs.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
     # Plot ZT
     print("Plotting ZT UMAP...")
-    fig = umap(adata, rep="ZTs", color=["cell_name", "Agg_Treatment"], return_fig=True)
-    fig.savefig(os.path.join(output_dir,"UMAP_ZTs.png"), dpi=300, bbox_inches="tight")
+    fig = umap(adata_sub, rep="ZTs", color=["dose", "Agg_Treatment"], return_fig=True)
+    fig.savefig(os.path.join(output_dir,f"UMAP_ZTs{filter_suffix}.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
     # Plot before FCR
+    print("Plotting raw UMAPs...")
     fig = raw_umap(adata, feature="cell_name")
-    fig.savefig(os.path.join(output_dir,"UMAP_cell_name.png"), dpi=300, bbox_inches="tight")
+    fig.savefig(os.path.join(output_dir,f"UMAP_cell_name.png"), dpi=300, bbox_inches="tight")
 
     fig = raw_umap(adata, feature="Agg_Treatment")
     fig.savefig(os.path.join(output_dir,"UMAP_treatment.png"), dpi=300, bbox_inches="tight")
+
+    fig = raw_umap(adata_sub, feature="dose")
+    fig.savefig(os.path.join(output_dir,f"UMAP_dose{filter_suffix}.png"), dpi=300, bbox_inches="tight")
 
 
 def plot_progression(model_dir, rep, feature, last_epoch=None, freq=50, n_cols=5):

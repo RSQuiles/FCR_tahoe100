@@ -59,7 +59,9 @@ def prepare_extract(args, state_dict=None):
 
     return model, datasets
 
-    
+# Check the stdout works
+# print("STDOUT works!\n")
+
 ## modified: add split to select desired dataste
 def prepare(args, state_dict=None, split_name="train"):
     """
@@ -99,7 +101,9 @@ def prepare(args, state_dict=None, split_name="train"):
     covariate_keys = covariate_keys,
     perturbation_key = perturbation_key,
     split_key = None,
-    sample_cf=(True if args["dist_mode"] == "match" else False))
+    sample_cf=(True if args["dist_mode"] == "match" else False),
+    #perturbation_input=args["perturbation_input"]
+    )
     
        
 
@@ -268,6 +272,10 @@ def train(args, prepare=prepare, state_dict=None):
                     if stop:
                         ljson({"early_stop": epoch})
                         break
+
+            # PRINT UMAPs AND SAVE THEM
+            plot_umaps(model_dir=args["artifact_path"])
+            plot_progression(model_dir=args["artifact_path"], rep="ZXs", feature="cell_name", freq=100)
 
             writer.close()
             return model

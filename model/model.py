@@ -47,7 +47,7 @@ def load_FCR(args, state_dict=None):
         omega0=args["omega0"],
         omega1=args["omega1"],
         omega2=args["omega2"],
-        omega3=args.get("omega3", 5.0),
+        omega3=args.get("omega3", 10.0),
         dist_mode=args["dist_mode"],
         dist_outcomes=args["dist_outcomes"],
         patience=args["patience"],
@@ -122,6 +122,11 @@ class FCR(nn.Module):
         # set hyperparameters
         self._set_hparams_(hparams)
 
+        ## modified: adapt for non-sampling case
+        if not self.hparams["sample_latent"]:
+            print("Using NON-SAMPLING approach!")
+            self.mc_sample_size = 1
+
         # individual-specific model
         self._init_indiv_model()
 
@@ -159,6 +164,7 @@ class FCR(nn.Module):
             "discriminator_wd": 4e-7,
             "discriminator_steps": 3,
             "step_size_lr": 45,
+            "sample_latent": True
         }
 
         if hparams != "":
@@ -608,7 +614,10 @@ class FCR(nn.Module):
         sigma = sigma.repeat(size, 1)
         latents = self.reparameterize(mu, sigma)
         return self.control_decode(latents)
-    
+
+    ## modified: new function to forward the latent mean directly
+    def forward_control(self, mu: torch.Tensor):
+        return self.control_decode(mu)
     
     def sample_expr(self, mu: torch.Tensor, sigma: torch.Tensor,size=1) -> torch.Tensor:
         
@@ -616,6 +625,10 @@ class FCR(nn.Module):
         sigma = sigma.repeat(size, 1)
         latents = self.reparameterize(mu, sigma)        
         return self.decode(latents)
+
+    ## modified: new function to forward the latent mean directly
+    def forward_expr(self, mu: torch.Tensor):
+        return self.decode(mu)
     
     ## permutation function for latent space Z_XT
     ## input: joint distribution mu and sigma, and ZXT's sigma mu
@@ -1029,7 +1042,7 @@ class FCR(nn.Module):
 
 
     def forward(self, outcomes, treatments, control_outcomes, covariates,
-                sample_latent=True, sample_outcome=False, detach_encode=False, detach_eval=True):
+                sample_latent=True, detach_encode=False, detach_eval=True):
         """
         Execute the workflow.
         """
@@ -1123,7 +1136,11 @@ class FCR(nn.Module):
         #print(ZX_constr[...,1].shape)
 
         # Reconstruct covariates from latent
-        cov_inputs = ZX_resample
+        ## modified: added "non-sampling" case
+        if sample_latent:
+            cov_inputs = ZX_resample
+        else:
+            cov_inputs = ZX_constr[...,0]
         #print("cov_inputs shape:", cov_inputs.shape)
         cov_constr = self.covariate_decode(cov_inputs)
 
@@ -1136,7 +1153,12 @@ class FCR(nn.Module):
         ZTs_control = torch.cat([ZT_control_resample, ZXT_control_resample], dim=1)
 
         # Reconstruct treatment from latent
-        treatment_constr = self.intervention_decode(ZTs, ZTs_control)
+        ## modified: added "non-sampling" case
+        if sample_latent:
+            treatment_constr = self.intervention_decode(ZTs, ZTs_control)
+        else:
+            treatment_constr = self.intervention_decode(torch.cat([ZT_constr[...,0], ZXT_constr[...,0]], dim=1), 
+                                                        torch.cat([ZT_control_constr[...,0], ZXT_control_constr[...,0]], dim=1))
 
         # GENERATE (ZX, ZXT, ZT) (POSTERIOR) LATENT DISTRIBUTIONS:
 
@@ -1149,12 +1171,20 @@ class FCR(nn.Module):
             dim=control_latents_dist_mean.size(1),
             dist="normal",
         )
-        control_outcomes_constr_samp = self.sample_control(
-            control_latents_dist_mean,
-            control_latents_dist_stddev,
-            size=self.mc_sample_size,
-        )
-        control_outcomes_dist_samp = self.distributionize(control_outcomes_constr_samp)
+
+        ## modified: added "non-sampling" case
+        if sample_latent:
+            control_outcomes_constr = self.sample_control(
+                control_latents_dist_mean,
+                control_latents_dist_stddev,
+                size=self.mc_sample_size,
+            )
+        else:
+            control_outcomes_constr = self.forward_control(
+                control_latents_dist_mean
+            )
+
+        control_outcomes_dist = self.distributionize(control_outcomes_constr)
 
         exp_latents_dist_mean = torch.cat([ZX_dist.mean, ZXT_dist.mean, ZT_dist.mean], dim=1)
         exp_latents_dist_stddev = torch.cat([ZX_dist.stddev, ZXT_dist.stddev, ZT_dist.stddev], dim=1)
@@ -1165,13 +1195,18 @@ class FCR(nn.Module):
             dist="normal",
         )
         # print("exp_dist.mean, exp_dist.stddev: ", exp_dist.mean.shape, exp_dist.stddev.shape)
-        
-        expr_outcomes_constr_samp = self.sample_expr(exp_latents_dist_mean, exp_latents_dist_stddev, size=self.mc_sample_size)
-        expr_outcomes_dist_samp = self.distributionize(expr_outcomes_constr_samp)
+
+        ## modified: added "non-sampling" case
+        if sample_latent:
+            expr_outcomes_constr = self.sample_expr(exp_latents_dist_mean, exp_latents_dist_stddev, size=self.mc_sample_size)
+        else:
+            expr_outcomes_constr = self.forward_expr(exp_latents_dist_mean)
+
+        expr_outcomes_dist = self.distributionize(expr_outcomes_constr)
 
         results = [
-            control_outcomes_dist_samp, # distribution for control outcomes
-            expr_outcomes_dist_samp,    # distribution for treated outcomes
+            control_outcomes_dist, # distribution for control outcomes
+            expr_outcomes_dist,    # distribution for treated outcomes
             exp_dist,                   # distribution for treated latents
             ZX_constr,
             ZT_constr,
@@ -1201,7 +1236,7 @@ class FCR(nn.Module):
             control_outcomes_dist_samp, expr_outcomes_dist_samp, exp_dist, ZX, ZT, ZXT, \
             ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_latents_dist, control_prior_dist, \
             cov_constr, treatment_constr, sim_loss = self.forward(
-                expr_outcomes, treatments, control_outcomes, covariates
+                expr_outcomes, treatments, control_outcomes, covariates, sample_latent=self.hparams["sample_latent"]
             )
 
             indiv_spec_nllh_control, indiv_spec_nllh_experiments, cov_loss, treatment_loss,\
@@ -1267,8 +1302,10 @@ class FCR(nn.Module):
         else:
             with torch.no_grad():
                 control_outcomes_dist_samp, expr_outcomes_dist_samp, exp_dist, ZX, ZT, ZXT, \
-            ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_latents_dist, control_prior_dist, \
-            cov_constr, treatment_constr, sim_loss = self.forward(expr_outcomes, treatments, control_outcomes, covariates)
+                ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_latents_dist, control_prior_dist, \
+                cov_constr, treatment_constr, sim_loss = self.forward(expr_outcomes, treatments, 
+                                                                      control_outcomes, covariates, 
+                                                                      sample_latent=self.hparams["sample_latent"])
                 
                 indiv_spec_nllh_control, indiv_spec_nllh_experiments, cov_loss, treatment_loss,\
                 kl_divergence_ind, kl_divergence_X, kl_divergence_T, kl_divergence_XT,kl_divergence_control ,conditions, conditions_labels= \
@@ -1632,6 +1669,27 @@ class FCR(nn.Module):
         ZT_resample = self.sample_latent(ZT[0], ZT[1])
         return ZX_resample,ZXT_resample, ZT_resample
     
+    @torch.no_grad()
+    def get_latent_means(self, outcomes, treatments, covariates):
+        """
+        Deterministic latent representations (posterior means).
+
+        Returns the means of q(zx|y,x), q(zxt|y,t,x), q(zt|y,t) without sampling.
+        Useful for visualization (e.g., UMAP) to avoid adding sampling noise.
+        """
+        outcomes, treatments, covariates = self.move_inputs(
+            outcomes, treatments, covariates
+        )
+        exp_constr = self.encode_exp(outcomes, covariates, treatments)
+        exp_dist = self.distributionize(
+            exp_constr, dim=self.hparams["latent_exp_dim"], dist="normal"
+        )
+
+        ZX_mean = exp_dist.mean[:, :self.ZX_dim]
+        ZXT_mean = exp_dist.mean[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]
+        ZT_mean = exp_dist.mean[:, self.ZX_dim+self.ZXT_dim:]
+
+        return ZX_mean, ZXT_mean, ZT_mean
     
     @torch.no_grad()
     def get_latent_presentation(self, outcomes, treatments, covariates, sample=False):
@@ -1639,11 +1697,11 @@ class FCR(nn.Module):
             outcomes, treatments, covariates
         )
         if not sample:
-            ZX, ZXT, ZT = self.get_latent(
+            # Return posterior means (deterministic) for visualization
+            ZX_mean, ZXT_mean, ZT_mean = self.get_latent_means(
                 outcomes, treatments, covariates
             )
-            
-            return ZX, ZXT, ZT
+            return ZX_mean, ZXT_mean, ZT_mean
         else:
             # FIXED BY MARINA - Proper sampling without double resampling
             exp_constr = self.encode_exp(outcomes, covariates, treatments)

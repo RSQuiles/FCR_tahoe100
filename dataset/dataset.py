@@ -29,7 +29,8 @@ class Dataset:
         test_ratio=0.2,
         random_state=42,
         sample_cf=False,
-        cf_samples=20
+        cf_samples=20,
+        perturbation_input="ohe"
     ):
         if type(data) == str:
             data = sc.read(data)
@@ -125,16 +126,22 @@ class Dataset:
             zip(pert_unique, pert_unique_onehot)
         )
 
-        # get perturbation combinations
-        perturbations = []
-        for i, comb in enumerate(self.pert_names):
-            perturbation_combos = [self.perts_dict[p] for p in comb.split("+")]
-            dose_combos = str(data.obs[dose_key].values[i]).split("+")
-            perturbation_ohe = []
-            for j, d in enumerate(dose_combos):
-                perturbation_ohe.append(float(d) * perturbation_combos[j])
-            perturbations.append(sum(perturbation_ohe))
-        self.perturbations = torch.stack(perturbations)
+        if perturbation_input == "ohe":
+            # Using custom OHE for perturbations
+            # get perturbation combinations
+            perturbations = []
+            for i, comb in enumerate(self.pert_names):
+                perturbation_combos = [self.perts_dict[p] for p in comb.split("+")]
+                dose_combos = str(data.obs[dose_key].values[i]).split("+")
+                perturbation_ohe = []
+                for j, d in enumerate(dose_combos):
+                    perturbation_ohe.append(float(d) * perturbation_combos[j])
+                perturbations.append(sum(perturbation_ohe))
+            self.perturbations = torch.stack(perturbations)
+        
+        else:
+            raise NotImplementedError("ChemBERTa perturbation input not implemented yet.")
+        
         self.controls = data.obs[self.control_key].values.astype(bool)
         
         if covariate_keys is not None:
@@ -380,7 +387,7 @@ class SubDataset_Pair:
     
     
     
-
+# LEGACY CODE: not used in currrent implementation
 def load_dataset_splits(
     data_path: str,
     perturbation_key: str = "perturbation",
@@ -414,6 +421,7 @@ def load_dataset_splits(
 def load_dataset_train_test(
     data_path: str,
     perturbation_key: str = "Agg_Treatment",
+    #perturbation_input: str = "ohe",
     control_key: str = "control",
     dose_key: str = "dose",
     covariate_keys: Union[list, str] = "covariates",
