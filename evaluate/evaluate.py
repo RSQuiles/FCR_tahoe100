@@ -276,8 +276,7 @@ def evaluate_prediction_r2(model, dataset, batch_size=None, min_samples=30):
             mean_score_mean = np.mean(mean_score) if len(mean_score) else -1
             mean_score_stddev = np.std(mean_score) if len(mean_score) else -1
 
-    return [mean_score_mean, mean_score_stddev
-    ]
+    return [mean_score_mean, mean_score_stddev]
 
 def evaluate_prediction_baseline(adata, batch_size=None, min_samples=30):
    

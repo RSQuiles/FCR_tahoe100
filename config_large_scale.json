@@ -1,0 +1,117 @@
+{
+  "_comment": "Optimized configuration for large-scale FCR training (8M+ samples)",
+  
+  "name": "fcr_large_scale",
+  "experiment": "8m_samples_optimized",
+  "seed": 42,
+  
+  "data_path": "/path/to/your/large_dataset.h5ad",
+  "artifact_path": "./experiments/large_scale/",
+  
+  "perturbation_key": "Agg_Treatment",
+  "covariate_keys": ["cell_type"],
+  "perturbation_input": "ohe",
+  "control_name": "DMSO_TF",
+  "embedded_dose": null,
+  "split": null,
+  
+  "num_outcomes": null,
+  "num_treatments": null,
+  "num_covariates": null,
+  
+  "embed_outcomes": true,
+  "embed_treatments": false,
+  "embed_covariates": true,
+  "separate_outcomes_emb": true,
+  
+  "dist_mode": "match",
+  "dist_outcomes": "normal",
+  "type_treatments": null,
+  "type_covariates": null,
+  "distance": "element",
+  
+  "omega0": 1.0,
+  "omega1": 10.0,
+  "omega2": 0.1,
+  "omega3": 10.0,
+  "omega4": 10.0,
+  
+  "_comment_optimization": "CRITICAL optimizations for memory and speed",
+  "batch_size": 256,
+  "gradient_accumulation_steps": 4,
+  "use_mixed_precision": true,
+  "num_workers": 4,
+  "pin_memory": true,
+  "prefetch_factor": 2,
+  
+  "max_epochs": 50,
+  "checkpoint_freq": 5,
+  "adv_epoch": 1,
+  
+  "patience": 5,
+  "best_score": -1000000000.0,
+  
+  "cpu": false,
+  "gpu": 0,
+  "sweep": false,
+  
+  "hparams": {
+    "ZX_dim": 32,
+    "ZT_dim": 32,
+    "ZXT_dim": 64,
+    
+    "outcome_emb_dim": 128,
+    "treatment_emb_dim": 64,
+    "covariate_emb_dim": 16,
+    
+    "encoder_width": 128,
+    "encoder_depth": 3,
+    "decoder_width": 128,
+    "decoder_depth": 3,
+    "discriminator_width": 64,
+    "discriminator_depth": 2,
+    
+    "autoencoder_lr": 0.001,
+    "discriminator_lr": 0.001,
+    "autoencoder_wd": 4e-07,
+    "discriminator_wd": 4e-07,
+    "discriminator_steps": 3,
+    "step_size_lr": 45,
+    
+    "_comment_sampling": "CRITICAL: Disable MC sampling during training for 30x speedup",
+    "sample_latent": false
+  },
+  
+  "_comment_scaling": "Progressive scaling strategy",
+  "_scaling_strategy": {
+    "phase_1_1pct": {
+      "data_fraction": 0.01,
+      "max_epochs": 10,
+      "goal": "Verify training works"
+    },
+    "phase_2_10pct": {
+      "data_fraction": 0.1,
+      "max_epochs": 20,
+      "goal": "Profile memory and speed"
+    },
+    "phase_3_full": {
+      "data_fraction": 1.0,
+      "max_epochs": 50,
+      "goal": "Full training"
+    }
+  },
+  
+  "_expected_performance": {
+    "memory_per_gpu": "~12GB with optimizations (vs ~40GB without)",
+    "samples_per_sec": "~2000-5000 (depends on GPU)",
+    "time_per_epoch": "~30-60 minutes for 8M samples",
+    "total_training_time": "~25-50 hours for 50 epochs"
+  },
+  
+  "_hardware_recommendations": {
+    "minimum": "1x A100 (40GB) or 1x V100 (32GB)",
+    "recommended": "1x A100 (80GB) or 2x A100 (40GB) with DDP",
+    "cpu_workers": "4-8 CPU cores for data loading",
+    "ram": "32GB+ system RAM"
+  }
+}

@@ -2,6 +2,7 @@ from typing import Union
 import scipy
 import numpy as np
 import scanpy as sc
+import pandas as pd
 
 import torch
 
@@ -30,38 +31,54 @@ class Dataset:
         random_state=42,
         sample_cf=False,
         cf_samples=20,
-        perturbation_input="ohe"
+        perturbation_input="ohe",
+        control_name= None,
+        embedded_dose= None,
+        args = None,
     ):
         if type(data) == str:
+            print("Reading AnnData...")
             data = sc.read(data)
 
         self.sample_cf = sample_cf
         self.cf_samples = cf_samples
 
+        # MODIFIED INCREASE FLEXIBILITY AND ADAPT TO TAHOE100 Dataset
         # Fields
         # perturbation
-        if perturbation_key in data.uns["fields"]:
-            perturbation_key = data.uns["fields"][perturbation_key]
-        else:
-            assert perturbation_key in data.obs.columns, f"Perturbation {perturbation_key} is missing in the provided adata"
+        #if perturbation_key in data.uns["fields"]:
+        #    perturbation_key = data.uns["fields"][perturbation_key]
+        #else:
+        assert perturbation_key in data.obs.columns, f"Perturbation {perturbation_key} is missing in the provided adata"
+
         # control
-        if control_key in data.uns["fields"]:
-            control_key = data.uns["fields"][control_key]
-        else:
-            assert control_key in data.obs.columns, f"Control {control_key} is missing in the provided adata"
+        #if control_key in data.uns["fields"]:
+        #    control_key = data.uns["fields"][control_key]
+        #else:
+        if control_key not in data.obs.columns:
+            if control_name is not None:
+                print(f"Adding control column based on control name: {control_name}...")
+                data.obs[control_key] = (data.obs[perturbation_key] == control_name).astype(int)
+            else:
+                raise ValueError(f"Control {control_key} is missing in the provided adata and no control_name was given.")
+        
         # dose
-        if dose_key in data.uns["fields"]:
-            dose_key = data.uns["fields"][dose_key]
-        elif dose_key is None:
+        #if dose_key in data.uns["fields"]:
+        #    dose_key = data.uns["fields"][dose_key]
+        if dose_key is None:
             print("Adding a dummy dose...")
             data.obs["dummy_dose"] = 1.0
             dose_key = "dummy_dose"
-        else:
-            assert dose_key in data.obs.columns, f"Dose {dose_key} is missing in the provided adata"
+        elif dose_key not in data.obs.columns:
+            if embedded_dose is not None:
+                data.obs[dose_key] = data.obs[embedded_dose].str.split(",").str[1].astype(float)
+            else:
+                raise ValueError(f"Dose {dose_key} is missing in the provided adata and no embedded_dose column was given.")
+
         # covariates
-        if isinstance(covariate_keys, str) and covariate_keys in data.uns["fields"]:
-            covariate_keys = list(data.uns["fields"][covariate_keys])
-        elif covariate_keys is None or len(covariate_keys)==0:
+        #if isinstance(covariate_keys, str) and covariate_keys in data.uns["fields"]:
+        #    covariate_keys = list(data.uns["fields"][covariate_keys])
+        if covariate_keys is None or len(covariate_keys)==0:
             print("Adding a dummy covariate...")
             data.obs["dummy_covar"] = "dummy-covar"
             covariate_keys = ["dummy_covar"]
@@ -71,9 +88,9 @@ class Dataset:
             for key in covariate_keys:
                 assert key in data.obs.columns, f"Covariate {key} is missing in the provided adata"
         # split
-        if split_key in data.uns["fields"]:
-            split_key = data.uns["fields"][split_key]
-        elif split_key is None:
+        #if split_key in data.uns["fields"]:
+        #    split_key = data.uns["fields"][split_key]
+        if split_key is None:
             print(f"Performing automatic train-test split with {test_ratio} ratio.")
             from sklearn.model_selection import train_test_split
 
@@ -97,6 +114,7 @@ class Dataset:
         }
 
         self.perturbation_key = perturbation_key
+        self.perturbation_input = perturbation_input
         self.control_key = control_key
         self.dose_key = dose_key
         self.covariate_keys = covariate_keys
@@ -118,16 +136,13 @@ class Dataset:
         # get unique perturbations
         pert_unique = np.array(self.get_unique_perts())
 
-        # store as attribute for molecular featurisation
-        pert_unique_onehot = torch.eye(len(pert_unique))
-    
-
-        self.perts_dict = dict(
-            zip(pert_unique, pert_unique_onehot)
-        )
-
-        if perturbation_input == "ohe":
+        if self.perturbation_input == "ohe":
             # Using custom OHE for perturbations
+            # store as attribute for molecular featurisation
+            pert_unique_onehot = torch.eye(len(pert_unique))
+            self.perts_dict = dict(
+                zip(pert_unique, pert_unique_onehot)
+            )
             # get perturbation combinations
             perturbations = []
             for i, comb in enumerate(self.pert_names):
@@ -137,10 +152,72 @@ class Dataset:
                 for j, d in enumerate(dose_combos):
                     perturbation_ohe.append(float(d) * perturbation_combos[j])
                 perturbations.append(sum(perturbation_ohe))
+
             self.perturbations = torch.stack(perturbations)
-        
+            self.num_treatments = len(pert_unique) # treatment input dimension
+
+        elif self.perturbation_input == "chemberta":
+            print("Using ChemBERTa embeddings for perturbations!")
+            from transformers import AutoTokenizer, AutoModel
+            MODEL_ID = "DeepChem/ChemBERTa-100M-MLM"
+
+            # select device
+            device = (
+                "cuda:" + str(args["gpu"])
+                    if (not args["cpu"]) 
+                        and torch.cuda.is_available() 
+                    else 
+                "cpu"
+            )
+
+            # Load the tokenizer and model
+            print("Loading ChemBERTa model...")
+            tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+            model = AutoModel.from_pretrained(MODEL_ID).to(device).eval()
+
+            # Load drug metadata
+            print("Generating perturbation SMILES...")
+            drug_metadata_path = "/cluster/work/bewi/members/rquiles/experiments/datasets/drug_metadata.parquet"
+            drug_metadata = pd.read_parquet(drug_metadata_path)
+            self.pert_smiles = np.array([drug_metadata[drug_metadata["drug"] == name]["canonical_smiles"].astype(str).iloc[0] for name in self.pert_names]).tolist()
+
+            # Generate embeddings
+            emb_list = [] 
+            batch_size = 1024 # tune depending on GPU memory
+
+            # Iterate through pert_smiles in batches
+            print("Generating embeddings...")
+            for i in range(0, len(self.pert_smiles), batch_size):
+                batch_smiles = self.pert_smiles[i:i + batch_size]
+
+                # Tokenize batch
+                batch = tokenizer(
+                    batch_smiles,
+                    padding=True,
+                    truncation=True,
+                    max_length=256,
+                    return_tensors="pt"
+                ).to(device)
+
+                # Forward pass
+                with torch.no_grad():
+                    outputs = model(**batch)
+                    hidden_states = outputs.last_hidden_state
+
+                    # Mask-aware mean pooling
+                    attn = batch["attention_mask"].unsqueeze(-1).float()
+                    emb = (hidden_states * attn).sum(1) / attn.sum(1)
+
+                # Move embeddings to CPU and store
+                emb_list.append(emb.cpu())
+
+            # Concatenate all batches into one big tensor
+            self.perturbations = torch.cat(emb_list, dim=0)
+            self.num_treatments = self.perturbations.shape[1] # treatment input dimension
+            # print(f"Perturbation embeddings shape: {self.perturbations.shape}")
+            
         else:
-            raise NotImplementedError("ChemBERTa perturbation input not implemented yet.")
+            raise NotImplementedError("Unmatched input mode for treatments")
         
         self.controls = data.obs[self.control_key].values.astype(bool)
         
@@ -174,7 +251,6 @@ class Dataset:
             self.num_covariates = None
 
         self.num_outcomes = self.genes.shape[1]
-        self.num_treatments = len(pert_unique)
 
         self.cov_pert = np.array([
             f"{self.cov_names[i]}_"
@@ -235,13 +311,15 @@ class SubDataset:
         self.cf_samples = dataset.cf_samples
 
         self.perturbation_key = dataset.perturbation_key
+        self.perturbation_input = dataset.perturbation_input
         self.control_key = dataset.control_key
         self.dose_key = dataset.dose_key
         self.covariate_keys = dataset.covariate_keys
 
         self.control_names = dataset.control_names
 
-        self.perts_dict = dataset.perts_dict
+        if self.perturbation_input == "ohe":
+            self.perts_dict = dataset.perts_dict
         self.covars_dict = dataset.covars_dict
 
         self.genes = dataset.genes[indices]
@@ -313,13 +391,15 @@ class SubDataset_Pair:
         self.cf_samples = dataset.cf_samples
 
         self.perturbation_key = dataset.perturbation_key
+        self.perturbation_input = dataset.perturbation_input
         self.control_key = dataset.control_key
         self.dose_key = dataset.dose_key
         self.covariate_keys = dataset.covariate_keys
 
         self.control_names = dataset.control_names
 
-        self.perts_dict = dataset.perts_dict
+        if self.perturbation_input == "ohe":
+            self.perts_dict = dataset.perts_dict
         self.covars_dict = dataset.covars_dict
 
         self.genes = dataset.genes[indices]
@@ -344,6 +424,7 @@ class SubDataset_Pair:
         self.num_covariates = dataset.num_covariates
         self.num_outcomes = dataset.num_outcomes
         self.num_treatments = dataset.num_treatments
+        # print(f"num_treatments in SubDataset_Pair: {self.num_treatments}")
 
         if self.sample_cf:
             self.cov_pert_dose_idx = unique_ind(self.cov_pert_dose)
@@ -416,23 +497,25 @@ def load_dataset_splits(
         return splits
     
     
-    
-    
 def load_dataset_train_test(
     data_path: str,
     perturbation_key: str = "Agg_Treatment",
-    #perturbation_input: str = "ohe",
+    perturbation_input: str = "ohe",
     control_key: str = "control",
     dose_key: str = "dose",
     covariate_keys: Union[list, str] = "covariates",
     split_key: str = "split",
+    control_name: str = None,
+    embedded_dose: str = None,
     sample_cf: bool = False,
     return_dataset: bool = False,
+    args = None,
 ):
 
     dataset = Dataset(
         data_path, perturbation_key, control_key, dose_key, covariate_keys, split_key, 
-        sample_cf=sample_cf
+        sample_cf=sample_cf, control_name=control_name, embedded_dose=embedded_dose,
+        perturbation_input=perturbation_input, args=args
     )
 
     splits = {

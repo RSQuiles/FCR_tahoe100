@@ -44,19 +44,22 @@ def load_FCR(args, state_dict=None):
         embed_outcomes=args["embed_outcomes"],
         embed_treatments=args["embed_treatments"],
         embed_covariates=args["embed_covariates"],
-        omega0=args["omega0"],
-        omega1=args["omega1"],
-        omega2=args["omega2"],
-        omega3=args.get("omega3", 10.0),
+        omega0=args["omega0"], # NLLH
+        omega1=args["omega1"], # treatment_loss + covar_loss
+        omega2=args["omega2"], # KL divergence
+        omega3=args.get("omega3", 10.0), # Permutation loss
+        omega4=args.get("omega4", 10.0), # Similarity loss
         dist_mode=args["dist_mode"],
         dist_outcomes=args["dist_outcomes"],
         patience=args["patience"],
         device=device,
         distance=args['distance'],
         hparams=args["hparams"],
-        ## modified: added batch size and sweep
+        ## modified: added batch size, sweep, and option to separate outcome embeddings
         batch_size=args["batch_size"],
-        sweep=args["sweep"]
+        sweep=args["sweep"],
+        separate_outcomes_emb=args["separate_outcomes_emb"]
+
     )
     if state_dict is not None:
         model.load_state_dict(state_dict)
@@ -78,10 +81,12 @@ class FCR(nn.Module):
         embed_outcomes=True,
         embed_treatments=False,
         embed_covariates=True,
+        separate_outcomes_emb=False, ## modified: added argument
         omega0=1.0,
         omega1=2.0,
         omega2=2.0,
-        omega3=5.0,
+        omega3=10.0,
+        omega4=10.0,
         dist_mode="match",
         dist_outcomes="normal",
         type_treatments=None,
@@ -105,12 +110,15 @@ class FCR(nn.Module):
         self.type_treatments = type_treatments
         self.type_covariates = type_covariates
         self.mc_sample_size = mc_sample_size
+        # NEW: Use separate outcomes embeddings for each encoder
+        self.separate_outcomes_emb = separate_outcomes_emb
         # fcr parameters
         self.omega0 = omega0
         self.omega1 = omega1
         self.omega2 = omega2
-        # NEW: weight for permutation discriminators
+        # NEW: weight for permutation discriminators and similarity loss
         self.omega3 = omega3
+        self.omega4 = omega4
         self.dist_mode = dist_mode
         # early-stopping
         self.best_score = best_score
@@ -195,10 +203,20 @@ class FCR(nn.Module):
 
         # embeddings
         if self.embed_outcomes:
-            self.outcomes_embeddings = self.init_outcome_emb()
+            # Separate outcome embeddings for each encoder to prevent information leakage
+            if self.separate_outcomes_emb:
+                self.outcomes_embeddings_ZX = self.init_outcome_emb()
+                self.outcomes_embeddings_ZT = self.init_outcome_emb()
+                self.outcomes_embeddings_ZXT = self.init_outcome_emb()
+                params.extend(list(self.outcomes_embeddings_ZX.parameters()))
+                params.extend(list(self.outcomes_embeddings_ZT.parameters()))
+                params.extend(list(self.outcomes_embeddings_ZXT.parameters()))
+            # Unique outcome embedding for all encoders
+            else:
+                self.outcomes_embeddings = self.init_outcome_emb()
+                params.extend(list(self.outcomes_embeddings.parameters()))
+
             self.outcomes_contr_embeddings = self.init_outcome_emb()
-            
-            params.extend(list(self.outcomes_embeddings.parameters()))
             params.extend(list(self.outcomes_contr_embeddings.parameters()))
 
         if self.embed_treatments:
@@ -399,9 +417,12 @@ class FCR(nn.Module):
         """
         
         if self.embed_outcomes:
-            #print("outcomes shape:", outcomes.shape)
-            #print("outcomes_embeddings in_features:", self.outcomes_embeddings.network[0].in_features)
-            outcomes = self.outcomes_embeddings(outcomes)
+            # Use ZX-specific outcome embedding to prevent information leakage
+            if self.separate_outcomes_emb:
+                outcomes = self.outcomes_embeddings_ZX(outcomes)
+            else:
+                outcomes = self.outcomes_embeddings(outcomes)
+
         if self.embed_covariates:
             # print("covariates[0] {}".format(covariates[0]))
             covariates = [emb(covars) for covars, emb in 
@@ -418,7 +439,12 @@ class FCR(nn.Module):
         
     def encode_ZT(self, outcomes, treatments, eval=False):
         if self.embed_outcomes:
-            outcomes = self.outcomes_embeddings(outcomes)
+            # Use ZT-specific outcome embedding to prevent information leakage
+            if self.separate_outcomes_emb:
+                outcomes = self.outcomes_embeddings_ZT(outcomes)
+            else:
+                outcomes = self.outcomes_embeddings(outcomes)
+
         if self.embed_treatments:
             treatments = self.treatments_embeddings(treatments)
             
@@ -433,7 +459,11 @@ class FCR(nn.Module):
     def encode_ZXT(self, outcomes, covariates, treatments, eval=False):
         ## modified: added the outcome embeddings
         if self.embed_outcomes:
-            outcomes = self.outcomes_embeddings(outcomes)
+            # Use ZXT-specific outcome embedding to prevent information leakage
+            if self.separate_outcomes_emb:
+                outcomes = self.outcomes_embeddings_ZXT(outcomes)
+            else:
+                outcomes = self.outcomes_embeddings(outcomes)
     
         if self.embed_covariates:
             covariates = [emb(covars) for covars, emb in 
@@ -1219,6 +1249,8 @@ class FCR(nn.Module):
             cov_constr,
             treatment_constr,
             sim_loss,
+            sim_t,
+            sim_x
         ]
             
         return results
@@ -1235,7 +1267,7 @@ class FCR(nn.Module):
         if not adv_training: 
             control_outcomes_dist_samp, expr_outcomes_dist_samp, exp_dist, ZX, ZT, ZXT, \
             ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_latents_dist, control_prior_dist, \
-            cov_constr, treatment_constr, sim_loss = self.forward(
+            cov_constr, treatment_constr, sim_loss, sim_t, sim_x = self.forward(
                 expr_outcomes, treatments, control_outcomes, covariates, sample_latent=self.hparams["sample_latent"]
             )
 
@@ -1268,16 +1300,16 @@ class FCR(nn.Module):
 
             indiv_spec_nllh = indiv_spec_nllh_control + indiv_spec_nllh_experiments
             # Include causal structure regularizer
-            covar_spec_loss = treatment_loss + cov_loss + sim_loss
+            covar_spec_loss = treatment_loss + cov_loss
             kl_divergence_factored = kl_divergence_X + kl_divergence_T + kl_divergence_XT
             kl_divergence_samples= kl_divergence_control + kl_divergence_ind
             kl_divergence = kl_divergence_factored + kl_divergence_samples
 
             loss = (self.omega0 * indiv_spec_nllh
                 + self.omega1 * covar_spec_loss
-                + self.omega2 * kl_divergence_samples
-                + self.omega2 * kl_divergence_factored
+                + self.omega2 * (kl_divergence_samples + kl_divergence_factored)
                 -  self.omega3 * permute_loss   
+                +  self.omega4 * sim_loss
             )
 
             self.optimizer_autoencoder.zero_grad()
@@ -1293,17 +1325,23 @@ class FCR(nn.Module):
             
             return {
                 "Indiv-spec NLLH": indiv_spec_nllh.item(),
-                "Covar-spec NLLH": covar_spec_loss.item(),
+                "Covar-spec Loss": covar_spec_loss.item(),
+                "Treatment Loss": treatment_loss.item(),
+                "Covariate Loss": cov_loss.item(),
+                "Similarity": sim_loss.item(),
+                "Treatment Similarity": sim_t.item(),
+                "Covariate Similarity": sim_x.item(),
                 "KL Divergence": kl_divergence.item(),
                 "Discriminator": permute_loss.item(),
-                "Loss":loss.item()
+                "Permute_T Loss": permute_T_loss.item(),
+                "Permute_X Loss": permute_X_loss.item()
             }
             
         else:
             with torch.no_grad():
                 control_outcomes_dist_samp, expr_outcomes_dist_samp, exp_dist, ZX, ZT, ZXT, \
                 ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_latents_dist, control_prior_dist, \
-                cov_constr, treatment_constr, sim_loss = self.forward(expr_outcomes, treatments, 
+                cov_constr, treatment_constr, sim_loss, sim_t, sim_x = self.forward(expr_outcomes, treatments, 
                                                                       control_outcomes, covariates, 
                                                                       sample_latent=self.hparams["sample_latent"])
                 
@@ -1325,7 +1363,7 @@ class FCR(nn.Module):
             
             indiv_spec_nllh = indiv_spec_nllh_control + indiv_spec_nllh_experiments
             # Include causal structure regularizer
-            covar_spec_loss = treatment_loss + cov_loss + sim_loss
+            covar_spec_loss = treatment_loss + cov_loss
             kl_divergence_factored = kl_divergence_X+kl_divergence_T+kl_divergence_XT
             kl_divergence_samples= kl_divergence_control + kl_divergence_ind
             kl_divergence = kl_divergence_factored + kl_divergence_samples
@@ -1333,6 +1371,7 @@ class FCR(nn.Module):
             permute_T_loss = self.loss_discriminator_T(permute_T_pred, perturb_T[:, -1]) 
             permute_X_loss = self.loss_discriminator_X(permute_X_pred, perturb_X[:, -1])
             permute_loss =  0.5 * (permute_T_loss + permute_X_loss)
+            
             self.optimizer_discriminator.zero_grad()
             permute_loss.backward() # Use only permute_loss to update gradients
             self.optimizer_discriminator.step()
@@ -1340,17 +1379,23 @@ class FCR(nn.Module):
             # Compute for logging purposes
             loss = (self.omega0 * indiv_spec_nllh
                 + self.omega1 * covar_spec_loss
-                + self.omega2 * kl_divergence_samples
-                + self.omega2 * kl_divergence_factored
-                -  self.omega3 * permute_loss   
+                + self.omega2 * (kl_divergence_samples + kl_divergence_factored)
+                -  self.omega3 * permute_loss
+                + self.omega4 * sim_loss
             )
 
             return {
                 "Indiv-spec NLLH": indiv_spec_nllh.item(),
-                "Covar-spec NLLH": covar_spec_loss.item(),
+                "Covar-spec Loss": covar_spec_loss.item(),
+                "Treatment Loss": treatment_loss.item(),
+                "Covariate Loss": cov_loss.item(),
+                "Similarity": sim_loss.item(),
+                "Treatment Similarity": sim_t.item(),
+                "Covariate Similarity": sim_x.item(),
                 "KL Divergence": kl_divergence.item(),
                 "Discriminator": permute_loss.item(),
-                "Loss": loss.item()
+                "Permute_T Loss": permute_T_loss.item(),
+                "Permute_X Loss": permute_X_loss.item()
             }
 
     def update_discriminator(self, outcomes, cf_outcomes_out,
@@ -1388,15 +1433,16 @@ class FCR(nn.Module):
 
     def init_treatment_emb(self):
         
-        if self.type_treatments in ("object", "bool", "category", None):
-            # print(self.num_treatments, self.hparams["treatment_emb_dim"])
-            return CompoundEmbedding(
-                self.num_treatments, self.hparams["treatment_emb_dim"]
-            )
-        else:
-            return MLP(
-                [self.num_treatments] + [self.hparams["treatment_emb_dim"]] * 2
-            )
+        # BUG: the OHE in treatments cannot be used as input for a CompoundEmbedding
+        # if self.type_treatments in ("object", "bool", "category", None):
+        #     # print(self.num_treatments, self.hparams["treatment_emb_dim"])
+        #     return CompoundEmbedding(
+        #         self.num_treatments, self.hparams["treatment_emb_dim"]
+        #     )
+        # else:
+        return MLP(
+            [self.num_treatments] + [self.hparams["treatment_emb_dim"]] * 2
+        )
         
         
     def init_treatment_mixed_emb(self):
@@ -1652,21 +1698,25 @@ class FCR(nn.Module):
         self.to(self.device)
 
     # BUG: defaults() invalid; please pass hparams explicitly via load_FCR
+    # Modified: use ZX, ZT, ZXT encoders instead of exp_encoder, which is not trained
     @torch.no_grad()
     def get_latent(self, outcomes, treatments, covariates):
         
-        exp_constr = self.encode_exp(outcomes, covariates, treatments)
-        exp_dist = self.distributionize(
-            exp_constr, dim=self.hparams["latent_exp_dim"], dist="normal"
+        outcomes, treatments, covariates = self.move_inputs(
+            outcomes, treatments, covariates
         )
+        ZX_constr = self.encode_ZX(outcomes, covariates)
+        ZX_dist = self.distributionize(ZX_constr, dim=self.hparams["ZX_dim"], dist="normal")
+
+        ZXT_constr = self.encode_ZXT(outcomes, covariates, treatments)
+        ZXT_dist = self.distributionize(ZXT_constr, dim=self.hparams["ZXT_dim"], dist="normal")
+
+        ZT_constr = self.encode_ZT(outcomes, treatments)
+        ZT_dist = self.distributionize(ZT_constr, dim=self.hparams["ZT_dim"], dist="normal")
         
-        ZX = (exp_dist.mean[:, :self.ZX_dim], exp_dist.stddev[:, :self.ZX_dim])
-        ZXT = (exp_dist.mean[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim], exp_dist.stddev[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim])
-        ZT = (exp_dist.mean[:, self.ZX_dim+self.ZXT_dim:], exp_dist.stddev[:, self.ZX_dim+self.ZXT_dim:])
-        
-        ZX_resample = self.sample_latent(ZX[0], ZX[1])
-        ZXT_resample = self.sample_latent(ZXT[0], ZXT[1])
-        ZT_resample = self.sample_latent(ZT[0], ZT[1])
+        ZX_resample = self.sample_latent(ZX_dist.mean, ZX_dist.stddev)
+        ZXT_resample = self.sample_latent(ZXT_dist.mean, ZXT_dist.stddev)
+        ZT_resample = self.sample_latent(ZT_dist.mean, ZT_dist.stddev)
         return ZX_resample,ZXT_resample, ZT_resample
     
     @torch.no_grad()
@@ -1680,14 +1730,18 @@ class FCR(nn.Module):
         outcomes, treatments, covariates = self.move_inputs(
             outcomes, treatments, covariates
         )
-        exp_constr = self.encode_exp(outcomes, covariates, treatments)
-        exp_dist = self.distributionize(
-            exp_constr, dim=self.hparams["latent_exp_dim"], dist="normal"
-        )
+        ZX_constr = self.encode_ZX(outcomes, covariates)
+        ZX_dist = self.distributionize(ZX_constr, dim=self.hparams["ZX_dim"], dist="normal")
 
-        ZX_mean = exp_dist.mean[:, :self.ZX_dim]
-        ZXT_mean = exp_dist.mean[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]
-        ZT_mean = exp_dist.mean[:, self.ZX_dim+self.ZXT_dim:]
+        ZXT_constr = self.encode_ZXT(outcomes, covariates, treatments)
+        ZXT_dist = self.distributionize(ZXT_constr, dim=self.hparams["ZXT_dim"], dist="normal")
+
+        ZT_constr = self.encode_ZT(outcomes, treatments)
+        ZT_dist = self.distributionize(ZT_constr, dim=self.hparams["ZT_dim"], dist="normal")
+
+        ZX_mean = ZX_dist.mean
+        ZXT_mean = ZXT_dist.mean
+        ZT_mean = ZT_dist.mean
 
         return ZX_mean, ZXT_mean, ZT_mean
     
@@ -1704,24 +1758,10 @@ class FCR(nn.Module):
             return ZX_mean, ZXT_mean, ZT_mean
         else:
             # FIXED BY MARINA - Proper sampling without double resampling
-            exp_constr = self.encode_exp(outcomes, covariates, treatments)
-            exp_dist = self.distributionize(
-                exp_constr, dim=self.hparams["latent_exp_dim"], dist="normal"
+            # FIXED BY RAFA - Use trained encoders instead of exp_encoder
+            ZX_sample, ZXT_sample, ZT_sample = self.get_latent(
+                outcomes, treatments, covariates
             )
-            
-            # Extract mean and stddev for each latent component
-            ZX_mean = exp_dist.mean[:, :self.ZX_dim]
-            ZX_stddev = exp_dist.stddev[:, :self.ZX_dim]
-            ZXT_mean = exp_dist.mean[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]
-            ZXT_stddev = exp_dist.stddev[:, self.ZX_dim:self.ZX_dim+self.ZXT_dim]
-            ZT_mean = exp_dist.mean[:, self.ZX_dim+self.ZXT_dim:]
-            ZT_stddev = exp_dist.stddev[:, self.ZX_dim+self.ZXT_dim:]
-            
-            # Sample once from the proper distributions (not double sampling)
-            ZX_sample = self.sample_latent(ZX_mean, ZX_stddev)
-            ZXT_sample = self.sample_latent(ZXT_mean, ZXT_stddev)
-            ZT_sample = self.sample_latent(ZT_mean, ZT_stddev)
-            
             return ZX_sample, ZXT_sample, ZT_sample
     
     
@@ -1761,7 +1801,7 @@ class FCR(nn.Module):
         control_latents_dist = self.distributionize(
             control_latent_constr, dim=self.hparams["latent_exp_dim"], dist="normal"
         )
-        return control_latents_dist.rsample()
+        return control_latents_dist.resample()
     
     
     @torch.no_grad()

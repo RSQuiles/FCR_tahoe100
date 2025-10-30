@@ -22,6 +22,8 @@
 	"omega0": 1,
 	"omega1": 10,
 	"omega2": 0.1,
+	"omega3": 10,
+	"omega4": 10,
 	"dist_outcomes": "normal",
 	"dist_mode": "match",
 	"distance": "element",

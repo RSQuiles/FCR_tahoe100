@@ -13,7 +13,7 @@ import re
 import math
 import matplotlib.colors as mcolors
 
-def compute_latents(trained_model, datasets, adata):
+def compute_latents(trained_model, datasets, adata, sample=False):
     print("Computing latent representations...")
     ZXs = []
     ZTs = []
@@ -22,7 +22,7 @@ def compute_latents(trained_model, datasets, adata):
         (genes, perts, cf_genes, cf_perts, covariates) = (
                 data[0], data[1], data[2], data[3], data[4:])
 
-        ZX, ZXT, ZT = trained_model.get_latent_presentation(genes, perts, covariates, sample=False)
+        ZX, ZXT, ZT = trained_model.get_latent_presentation(genes, perts, covariates, sample=sample)
         ZXs.extend(ZX)
         ZTs.extend(ZT)
         ZXTs.extend(ZXT)
@@ -122,8 +122,49 @@ def umap(adata,
 
     return figure
 
+def filter_adata(adata, filter_dict):
+    """
+    Filter an AnnData object based on a filter dictionary.
+    
+    Parameters
+    ----------
+    adata : AnnData
+        The AnnData object to filter.
+    filter_dict : dict
+        Dictionary specifying filters to apply on the data (e.g., {"drug": "DMSO_TF"}).
+        
+    Returns
+    -------
+    AnnData
+        Filtered AnnData object.
+    """
+    mask = np.ones(adata.n_obs, dtype=bool)
+    filter_suffix = ""
+    
+    for key, value in filter_dict.items():
+        if key not in adata.obs.columns:
+            print(f"Warning: '{key}' not found in adata.obs. Skipping this filter.")
+            continue
+        
+        # Handle single value or list of values
+        if isinstance(value, (list, tuple)):
+            mask &= adata.obs[key].isin(value)
+            filter_suffix += f"_{'_'.join(str(v) for v in value)}"
+        else:
+            mask &= (adata.obs[key] == value)
+            filter_suffix += f"_{value}"
 
-def plot_umaps(model_dir, target_epoch=None, filter_dict=None):
+    # Subset adata
+    n_before = adata.n_obs
+    adata_sub = adata[mask].copy()
+    n_after = adata_sub.n_obs
+    print(f"Applied filters: {filter_dict}")
+    print(f"Samples: {n_before} → {n_after} ({n_after/n_before*100:.1f}%)")
+    
+    return [adata_sub, filter_suffix]
+
+
+def plot_umaps(model_dir, target_epoch=None, filter_dict=None, all_drugs=False, sample=False):
     """
     Plot UMAPs for FCR latent representations.
     
@@ -152,56 +193,44 @@ def plot_umaps(model_dir, target_epoch=None, filter_dict=None):
     adata = sc.read(args["data_path"])
 
     # Append latents to adata
-    compute_latents(model, datasets, adata)
+    compute_latents(model, datasets, adata, sample=sample)
 
     # Apply filters if provided
     if filter_dict is not None:
-        mask = np.ones(adata.n_obs, dtype=bool)
-        filter_suffix = ""
-        
-        for key, value in filter_dict.items():
-            if key not in adata.obs.columns:
-                print(f"Warning: '{key}' not found in adata.obs. Skipping this filter.")
-                continue
-            
-            # Handle single value or list of values
-            if isinstance(value, (list, tuple)):
-                mask &= adata.obs[key].isin(value)
-                filter_suffix += f"_{'_'.join(str(v) for v in value)}"
-            else:
-                mask &= (adata.obs[key] == value)
-                filter_suffix += f"_{value}"
-        
-        # Subset adata
-        n_before = adata.n_obs
-        adata_sub = adata[mask].copy()
-        n_after = adata_sub.n_obs
-        print(f"Applied filters: {filter_dict}")
-        print(f"Samples: {n_before} → {n_after} ({n_after/n_before*100:.1f}%)")
-        
-        # Clean up suffix for filename
-        filter_suffix = filter_suffix.replace(" ", "_").replace("/", "_")[:50]
+        adata_sub, filter_suffix = filter_adata(adata, filter_dict)
     else:
         filter_suffix = ""
         adata_sub = adata
 
     # Plot ZX
     print("Plotting ZX UMAP...")
-    fig = umap(adata, rep="ZXs", color=["cell_name"], return_fig=True)
+    fig = umap(adata, rep="ZXs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
     fig.savefig(os.path.join(output_dir,"UMAP_ZXs.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
-    # PLot ZXT
+    # Plot ZXT
     print("Plotting ZXT UMAP...")
-    fig = umap(adata, rep="ZXTs", color=["cell_name", "dose", "Agg_Treatment"], return_fig=True)
+    fig = umap(adata, rep="ZXTs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
     fig.savefig(os.path.join(output_dir,f"UMAP_ZXTs.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
-    # Plot ZT
-    print("Plotting ZT UMAP...")
-    fig = umap(adata_sub, rep="ZTs", color=["dose", "Agg_Treatment"], return_fig=True)
-    fig.savefig(os.path.join(output_dir,f"UMAP_ZTs{filter_suffix}.png"), dpi=300, bbox_inches="tight")
-    plt.close()
+    if not all_drugs:
+        # Plot ZT
+        print("Plotting ZT UMAP...")
+        fig = umap(adata_sub, rep="ZTs", color=["dose", "Agg_Treatment", "cell_name"], return_fig=True)
+        fig.savefig(os.path.join(output_dir,f"UMAP_ZTs{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+        plt.close()
+        
+    # Option: print ZT against all drugs
+    else:
+        drugs_plot = [drug for drug in adata.obs["Agg_Treatment"].unique() if drug != "DMSO_TF"]
+        for drug in drugs_plot:
+            print(f"Plotting ZT UMAP for drug: {drug}...")
+            filter_dict = {"Agg_Treatment": [drug, "DMSO_TF"]}
+            adata_sub, filter_suffix = filter_adata(adata, filter_dict)
+            fig = umap(adata_sub, rep="ZTs", color=["dose", "Agg_Treatment", "cell_name"], return_fig=True)
+            fig.savefig(os.path.join(output_dir,f"UMAP_ZTs_{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+            plt.close()
 
     # Plot before FCR
     print("Plotting raw UMAPs...")

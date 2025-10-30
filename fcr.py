@@ -12,8 +12,11 @@ from .dataset.dataset import load_dataset_splits
 from .utils.general_utils import initialize_logger, ljson
 from .utils.data_utils import data_collate
 import argparse
-from .train import train
-from .train import prepare
+# from .train import train
+# from .train import prepare
+# Optimized versions
+from .train import train_optimized as train
+from .train import prepare_optimized as prepare
 import json
 import argparse
 
