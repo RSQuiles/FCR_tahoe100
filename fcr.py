@@ -7,18 +7,13 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from .evaluate.evaluate import evaluate, evaluate_classic
-from .model.model import load_FCR
 from .dataset.dataset import load_dataset_splits
 from .utils.general_utils import initialize_logger, ljson
 from .utils.data_utils import data_collate
+import json
 import argparse
 # from .train import train
 # from .train import prepare
-# Optimized versions
-from .train import train_optimized as train
-from .train import prepare_optimized as prepare
-import json
-import argparse
 
 """
 Fetch the latest model (path) given the directory where checkpoints are saved
@@ -84,7 +79,8 @@ This class allows to:
 - Import a model given the path to the checkpoint file
 """
 class FCR_sim:
-    def __init__(self, config_path=None, model_path=None, dataset_mode="train", parameters=None):
+    def __init__(self, config_path=None, model_path=None, dataset_mode="train", parameters=None,
+                 parallel=False):
         # Importing mode for dataset
         self.dataset_mode = dataset_mode
         if model_path != None:
@@ -117,6 +113,8 @@ class FCR_sim:
         return arguments
 
     def load_model(self, model_path, dataset="train"):
+        from .train import prepare
+
         if not os.path.isfile(model_path):
             raise FileNotFoundError("The model_path specified does not exist")
         else:
@@ -128,10 +126,16 @@ class FCR_sim:
                 
             self.model, self.dataset = prepare(self.arguments, state_dict[0], dataset)
     
-    def train_fcr(self, state_dict=None):
+    def train_fcr(self, state_dict=None, parallel=False):
         """
         Train an FCR model
         """
+        # Define input depending on parallel flag
+        if parallel:
+            from .train.train_parallel import train
+        else:
+            from .train.train import train
+        
         args = self.arguments
         train(args, state_dict=state_dict)
             

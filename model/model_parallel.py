@@ -20,7 +20,8 @@ from ..utils.math_utils import (
     logprob_zinb_positive,
     aggregate_normal_distr,
     marginalize_latent_tx,
-    marginalize_latent  
+    marginalize_latent
+    
 )
 
 #####################################################
@@ -198,7 +199,7 @@ class FCR(nn.Module):
         return self.hparams
 
     def _init_indiv_model(self):
-        params = []
+        self.params_autoencoder = []
 
         # embeddings
         if self.embed_outcomes:
@@ -207,29 +208,29 @@ class FCR(nn.Module):
                 self.outcomes_embeddings_ZX = self.init_outcome_emb()
                 self.outcomes_embeddings_ZT = self.init_outcome_emb()
                 self.outcomes_embeddings_ZXT = self.init_outcome_emb()
-                params.extend(list(self.outcomes_embeddings_ZX.parameters()))
-                params.extend(list(self.outcomes_embeddings_ZT.parameters()))
-                params.extend(list(self.outcomes_embeddings_ZXT.parameters()))
+                self.params_autoencoder.extend(list(self.outcomes_embeddings_ZX.parameters()))
+                self.params_autoencoder.extend(list(self.outcomes_embeddings_ZT.parameters()))
+                self.params_autoencoder.extend(list(self.outcomes_embeddings_ZXT.parameters()))
             # Unique outcome embedding for all encoders
             else:
                 self.outcomes_embeddings = self.init_outcome_emb()
-                params.extend(list(self.outcomes_embeddings.parameters()))
+                self.params_autoencoder.extend(list(self.outcomes_embeddings.parameters()))
 
             self.outcomes_contr_embeddings = self.init_outcome_emb()
-            params.extend(list(self.outcomes_contr_embeddings.parameters()))
+            self.params_autoencoder.extend(list(self.outcomes_contr_embeddings.parameters()))
 
         if self.embed_treatments:
             self.treatments_embeddings = self.init_treatment_emb()
-            params.extend(list(self.treatments_embeddings.parameters()))
+            self.params_autoencoder.extend(list(self.treatments_embeddings.parameters()))
 
         if self.embed_covariates:
             self.covariates_embeddings = nn.Sequential(*self.init_covariates_emb())
             for emb in self.covariates_embeddings:
-                params.extend(list(emb.parameters()))
+                self.params_autoencoder.extend(list(emb.parameters()))
                 
         self.treatments_mixed_embeddings = self.init_treatment_mixed_emb()
-        params.extend(list(self.treatments_mixed_embeddings.parameters()))        
-        
+        self.params_autoencoder.extend(list(self.treatments_mixed_embeddings.parameters()))
+
         ## dimension parameters
         self.ZX_dim = self.hparams["ZX_dim"]
         self.ZT_dim = self.hparams["ZT_dim"]
@@ -245,20 +246,20 @@ class FCR(nn.Module):
         
         ## control encoder brings in control-specific latent path
         self.control_encoder = self.init_encoder_control()
-        params.extend(list(self.encoder_ZX.parameters()))
-        params.extend(list(self.encoder_ZT.parameters()))
-        params.extend(list(self.encoder_ZXT.parameters()))
-        params.extend(list(self.control_encoder.parameters()))
+        self.params_autoencoder.extend(list(self.encoder_ZX.parameters()))
+        self.params_autoencoder.extend(list(self.encoder_ZT.parameters()))
+        self.params_autoencoder.extend(list(self.encoder_ZXT.parameters()))
+        self.params_autoencoder.extend(list(self.control_encoder.parameters()))
 
         ## initialize the prior encoders
         self.encoder_ZX_prior = self.init_encoder_X_prior()
         self.encoder_ZT_prior = self.init_encoder_T_prior()
         self.encoder_ZXT_prior = self.init_encoder_XT_prior()
         self.control_prior = self.init_control_prior()
-        params.extend(list(self.encoder_ZX_prior.parameters()))
-        params.extend(list(self.encoder_ZT_prior.parameters()))
-        params.extend(list(self.encoder_ZXT_prior.parameters()))
-        params.extend(list(self.control_prior.parameters()))
+        self.params_autoencoder.extend(list(self.encoder_ZX_prior.parameters()))
+        self.params_autoencoder.extend(list(self.encoder_ZT_prior.parameters()))
+        self.params_autoencoder.extend(list(self.encoder_ZXT_prior.parameters()))
+        self.params_autoencoder.extend(list(self.control_prior.parameters()))
 
         ## eval models
         ## modified: added self.exp_encoder_eval, commented out control_encoder_eval and control_prior_eval
@@ -274,14 +275,14 @@ class FCR(nn.Module):
         self.control_prior_eval = copy.deepcopy(self.control_prior)
 
         self.decoder = self.init_decoder_experiments()
-        params.extend(list(self.decoder.parameters()))
+        self.params_autoencoder.extend(list(self.decoder.parameters()))
         self.control_decoder = self.init_decoder_control()
-        params.extend(list(self.control_decoder.parameters()))
-        
+        self.params_autoencoder.extend(list(self.control_decoder.parameters()))
+
         ## covariate decoder
         self.cov_decoder = self.init_decoder_cov()
-        params.extend(list(self.cov_decoder.parameters()))
-                
+        self.params_autoencoder.extend(list(self.cov_decoder.parameters()))
+
         ##intervention decoder
         # print("intervention decoder style {}".format(self.distance))
         if self.distance == "cosine":
@@ -294,17 +295,7 @@ class FCR(nn.Module):
             self.interv_decoder = self.init_decoder_interv_single()
 
 
-        params.extend(list(self.interv_decoder.parameters()))
-
-        # optimizer
-        self.optimizer_autoencoder = torch.optim.Adam(
-            params,
-            lr=self.hparams["autoencoder_lr"],
-            weight_decay=self.hparams["autoencoder_wd"],
-        )
-        self.scheduler_autoencoder = torch.optim.lr_scheduler.StepLR(
-            self.optimizer_autoencoder, step_size=self.hparams["step_size_lr"]
-        )
+        self.params_autoencoder.extend(list(self.interv_decoder.parameters()))
 
         # return self.exp_encoder,self.decoder, self.control_encoder, self.control_decoder, self.cov_decoder, self.interv_decoder
         return self.exp_encoder,self.decoder, self.cov_decoder, self.interv_decoder
@@ -312,42 +303,33 @@ class FCR(nn.Module):
     def _init_covar_model(self):
 
         # if self.dist_mode == "discriminate":
-        params = []
+        self.params_discriminator = []
 
         # embeddings
         if self.embed_outcomes:
             self.adv_outcomes_emb = self.init_outcome_emb()
-            params.extend(list(self.adv_outcomes_emb.parameters()))
+            self.params_discriminator.extend(list(self.adv_outcomes_emb.parameters()))
 
         if self.embed_treatments:
             self.adv_treatments_emb = self.init_treatment_emb()
-            params.extend(list(self.adv_treatments_emb.parameters()))
+            self.params_discriminator.extend(list(self.adv_treatments_emb.parameters()))
 
         if self.embed_covariates:
             self.adv_covariates_emb = nn.Sequential(*self.init_covariates_emb())
             for emb in self.adv_covariates_emb:
-                params.extend(list(emb.parameters()))
+                self.params_discriminator.extend(list(emb.parameters()))
 
         # model
         self.discriminator_X = self.init_discriminator_X()
         self.loss_discriminator_X = nn.BCEWithLogitsLoss()
-        params.extend(list(self.discriminator_X.parameters()))
+        self.params_discriminator.extend(list(self.discriminator_X.parameters()))
 
         self.discriminator_T = self.init_discriminator_T()
         self.loss_discriminator_T = nn.BCEWithLogitsLoss()
-        params.extend(list(self.discriminator_T.parameters()))
+        self.params_discriminator.extend(list(self.discriminator_T.parameters()))
         # NEW: define a generic BCE loss to avoid AttributeError in legacy code
         self.loss_discriminator = nn.BCEWithLogitsLoss()
         # print("initialized discriminator {}".format(self.discriminator_T))
-
-        self.optimizer_discriminator = torch.optim.Adam(
-            params,
-            lr=self.hparams["discriminator_lr"],
-            weight_decay=self.hparams["discriminator_wd"],
-        )
-        self.scheduler_discriminator = torch.optim.lr_scheduler.StepLR(
-            self.optimizer_discriminator, step_size=self.hparams["step_size_lr"]
-        )
 
         return self.discriminator_X, self.discriminator_T
 
@@ -1255,7 +1237,10 @@ class FCR(nn.Module):
         return results
 
     
-    def update(self, expr_outcomes, treatments, control_outcomes, covariates, adv_training=False):
+    def update(self, expr_outcomes, treatments, control_outcomes, covariates,
+               optimizer_autoencoder,
+               optimizer_discriminator,
+               adv_training=False):
         """
         Update model's parameters given a minibatch of outcomes, treatments, and covariates.
         """
@@ -1311,10 +1296,10 @@ class FCR(nn.Module):
                 +  self.omega4 * sim_loss
             )
 
-            self.optimizer_autoencoder.zero_grad()
+            optimizer_autoencoder.zero_grad()
             loss.backward()
             # nn_utils.clip_grad_norm_(self.parameters(), max_norm=1.0) ## modified: avoid exploding gradients
-            self.optimizer_autoencoder.step()
+            optimizer_autoencoder.step()
             # Re-enable discriminator params
             for p in self.discriminator_T.parameters():
                 p.requires_grad_(True)
@@ -1371,9 +1356,9 @@ class FCR(nn.Module):
             permute_X_loss = self.loss_discriminator_X(permute_X_pred, perturb_X[:, -1])
             permute_loss =  0.5 * (permute_T_loss + permute_X_loss)
             
-            self.optimizer_discriminator.zero_grad()
+            optimizer_discriminator.zero_grad()
             permute_loss.backward() # Use only permute_loss to update gradients
-            self.optimizer_discriminator.step()
+            optimizer_discriminator.step()
             
             # Compute for logging purposes
             loss = (self.omega0 * indiv_spec_nllh
@@ -1411,11 +1396,12 @@ class FCR(nn.Module):
             target_param.data.copy_(param.data)
                     
 
-    def early_stopping(self, score):
+    def early_stopping(self, score, scheduler_autoencoder, scheduler_discriminator):
         """
         Decays the learning rate, and possibly early-stops training.
         """
-        self.scheduler_autoencoder.step()
+        scheduler_autoencoder.step()
+        scheduler_discriminator.step()
 
         if score > self.best_score:
             self.best_score = score
