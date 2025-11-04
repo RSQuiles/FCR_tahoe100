@@ -92,7 +92,7 @@ class Dataset:
         # split
         #if split_key in data.uns["fields"]:
         #    split_key = data.uns["fields"][split_key]
-        if split_key is None:
+        if split_key is None or split_key not in self.adata.obs.columns:
             print(f"Performing automatic train-test split with {test_ratio} ratio.")
             from sklearn.model_selection import train_test_split
 
@@ -262,87 +262,6 @@ class Dataset:
     def __len__(self):
         return self.n_obs
 
-
-class SubDataset:
-    """
-    Subsets a `Dataset` by selecting the examples given by `indices`.
-    """
-
-    def __init__(self, dataset, indices):
-        self.sample_cf = dataset.sample_cf
-        self.cf_samples = dataset.cf_samples
-
-        self.perturbation_key = dataset.perturbation_key
-        self.perturbation_input = dataset.perturbation_input
-        self.control_key = dataset.control_key
-        self.dose_key = dataset.dose_key
-        self.covariate_keys = dataset.covariate_keys
-
-        self.control_names = dataset.control_names
-
-        if self.perturbation_input == "ohe":
-            self.perts_dict = dataset.perts_dict
-        self.covars_dict = dataset.covars_dict
-
-        self.genes = dataset.genes[indices]
-        self.perturbations = indx(dataset.perturbations, indices)
-        self.controls = dataset.controls[indices]
-        self.covariates = [indx(cov, indices) for cov in dataset.covariates]
-
-        self.pert_names = indx(dataset.pert_names, indices)
-        self.doses = indx(dataset.doses, indices)
-
-        self.cov_names = indx(dataset.cov_names, indices)
-        self.cov_pert = indx(dataset.cov_pert, indices)
-        self.pert_dose = indx(dataset.pert_dose, indices)
-        self.cov_pert_dose = indx(dataset.cov_pert_dose, indices)
-        # self.cov_control = indx(dataset.cov_control, indices)
-
-        self.var_names = dataset.var_names
-        self.n_obs = dataset.n_obs
-        ## modified: commented out if de_genes not used downstream
-        #self.de_genes = dataset.de_genes
-
-        self.num_covariates = dataset.num_covariates
-        self.num_outcomes = dataset.num_outcomes
-        self.num_treatments = dataset.num_treatments
-
-        if self.sample_cf:
-            self.cov_pert_dose_idx = unique_ind(self.cov_pert_dose)
-
-    def subset_condition(self, control=True):
-        if control is None:
-            return self
-        else:
-            idx = np.where(self.controls == control)[0].tolist()
-            return SubDataset(self, idx)
-
-    def __getitem__(self, i):
-        cf_pert_dose_name = self.control_names[0]
-        while any(c in cf_pert_dose_name for c in self.control_names):
-            cf_i = np.random.choice(len(self.pert_dose))
-            cf_pert_dose_name = self.pert_dose[cf_i]
-
-        cf_genes = None
-        if self.sample_cf:
-            covariate_name = indx(self.cov_names, i)
-            cf_name = covariate_name + f"_{cf_pert_dose_name}"
-
-            if cf_name in self.cov_pert_dose_idx:
-                cf_inds = self.cov_pert_dose_idx[cf_name]
-                cf_genes = self.genes[np.random.choice(cf_inds, min(len(cf_inds), self.cf_samples))]
-
-        return (
-            self.genes[i],
-            indx(self.perturbations, i),
-            cf_genes,
-            indx(self.perturbations, cf_i),
-            *[indx(cov, i) for cov in self.covariates]
-        )
-
-    def __len__(self):
-        return self.n_obs
-
  
 class SubDataset_Pair:
     """
@@ -384,7 +303,7 @@ class SubDataset_Pair:
         self.control_vals = '1'
         
         self.var_names = dataset.var_names
-        self.n_obs = dataset.n_obs
+        self.n_obs = len(indices)
         ## modified: commented out if de_genes not used downstream
         #self.de_genes = dataset.de_genes
 
@@ -416,10 +335,15 @@ class SubDataset_Pair:
         cf_name = covariate_name + f"_{self.control_vals}"
         # print("cf_pert_dose_name {}".format(cf_pert_dose_name))
 
+        # Get counterfactual genes (from control)
         if cf_name in self.cov_control:
             cf_inds = self.cov_control_idx[cf_name]
             cf_i = np.random.choice(cf_inds)
-            cf_genes = self.genes[cf_i]
+            parent_cf_i = self.indices[cf_i]
+            cf_genes = self.dataset.adata.X[parent_cf_i,:]
+            if scipy.sparse.issparse(cf_genes):
+                cf_genes = cf_genes.toarray().squeeze()
+            cf_genes = torch.from_numpy(cf_genes)
         
         ### get gene activations
         parent_idx = self.indices[i]
@@ -438,7 +362,103 @@ class SubDataset_Pair:
 
     def __len__(self):
         return self.n_obs
-    
+
+class SubDataset:
+    """
+    Subsets a `SubDatasetPair` by selecting the examples given by `indices`.
+    """
+
+    def __init__(self, dataset, indices):
+        self.indices = indices
+        self.parent_dataset = dataset
+
+        self.sample_cf = dataset.sample_cf
+        self.cf_samples = dataset.cf_samples
+
+        self.perturbation_key = dataset.perturbation_key
+        self.perturbation_input = dataset.perturbation_input
+        self.control_key = dataset.control_key
+        self.dose_key = dataset.dose_key
+        self.covariate_keys = dataset.covariate_keys
+
+        self.control_names = dataset.control_names
+
+        if self.perturbation_input == "ohe":
+            self.perts_dict = dataset.perts_dict
+        self.covars_dict = dataset.covars_dict
+
+        # Obtain gene expression data
+        adata_indices = np.asarray(self.parent_dataset.indices)[indices]
+        adata_X = self.parent_dataset.dataset.adata.X
+        genes = adata_X[adata_indices, :]
+        if scipy.sparse.issparse(genes):
+            genes = genes.toarray().squeeze()
+
+        genes = torch.from_numpy(genes)
+        self.genes = genes
+
+        self.perturbations = indx(dataset.perturbations, indices)
+        self.controls = dataset.controls[indices]
+        self.covariates = [indx(cov, indices) for cov in dataset.covariates]
+
+        self.pert_names = indx(dataset.pert_names, indices)
+        self.doses = indx(dataset.doses, indices)
+
+        self.cov_names = indx(dataset.cov_names, indices)
+        self.cov_pert = indx(dataset.cov_pert, indices)
+        self.pert_dose = indx(dataset.pert_dose, indices)
+        self.cov_pert_dose = indx(dataset.cov_pert_dose, indices)
+        # self.cov_control = indx(dataset.cov_control, indices)
+
+        self.var_names = dataset.var_names
+        self.n_obs = len(indices)
+        ## modified: commented out if de_genes not used downstream
+        #self.de_genes = dataset.de_genes
+
+        self.num_covariates = dataset.num_covariates
+        self.num_outcomes = dataset.num_outcomes
+        self.num_treatments = dataset.num_treatments
+
+        if self.sample_cf:
+            self.cov_pert_dose_idx = unique_ind(self.cov_pert_dose)
+
+    def subset_condition(self, control=True):
+        if control is None:
+            return self
+        else:
+            idx = np.where(self.controls == control)[0].tolist()
+            return SubDataset(self, idx)
+
+    def __getitem__(self, i):
+        cf_pert_dose_name = self.control_names[0]
+        while any(c in cf_pert_dose_name for c in self.control_names):
+            cf_i = np.random.choice(len(self.pert_dose))
+            cf_pert_dose_name = self.pert_dose[cf_i]
+
+        cf_genes = None
+        if self.sample_cf:
+            covariate_name = indx(self.cov_names, i)
+            cf_name = covariate_name + f"_{cf_pert_dose_name}"
+
+            if cf_name in self.cov_pert_dose_idx:
+                cf_inds = self.cov_pert_dose_idx[cf_name]
+                cf_i = np.random.choice(cf_inds, min(len(cf_inds), self.cf_samples))
+                parent_cf_i = self.indices[cf_i]
+                cf_genes = self.parent_dataset.dataset.adata.X[parent_cf_i,:]
+                if scipy.sparse.issparse(cf_genes):
+                    cf_genes = cf_genes.toarray().squeeze()
+                cf_genes = torch.from_numpy(cf_genes)
+
+        return (
+            self.genes[i],
+            indx(self.perturbations, i),
+            cf_genes,
+            indx(self.perturbations, cf_i),
+            *[indx(cov, i) for cov in self.covariates]
+        )
+
+    def __len__(self):
+        return self.n_obs
     
     
 # LEGACY CODE: not used in currrent implementationM

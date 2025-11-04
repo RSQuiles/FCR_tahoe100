@@ -115,151 +115,6 @@ def setup(rank, world_size):
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
-def train_ddp(model, args, datasets, log_proc, 
-              optimizer_autoencoder, optimizer_discriminator,
-              scheduler_autoencoder, scheduler_discriminator):
-    """
-    Trains a FCR model with DDP
-    """
-    # Setup logging (only rank 0 process log)
-    if log_proc:
-        wandb.init(config=args, project=args["name"], name=args["experiment"])
-        wandb.watch(model, log_freq=10)
-
-        dt = datetime.now().strftime("%Y.%m.%d_%H:%M:%S")
-        writer = SummaryWriter(log_dir=os.path.join(args["artifact_path"], "runs/" + args["name"] + "_" + dt))
-        save_dir = os.path.join(args["artifact_path"], "saves/" + args["name"] + "_" + dt)
-        os.makedirs(save_dir, exist_ok=True)
-
-        initialize_logger(save_dir)
-        ljson({"training_args": args})
-        ljson({"model_params": model.hparams})
-        logging.info("")
-
-    start_time = time.time()
-
-    for epoch in range(args["max_epochs"]):
-        
-        epoch_training_stats = defaultdict(float)
-        if epoch % args["adv_epoch"]==0:
-            adv_training=True
-        else:
-            adv_training=False
-        # print("Adversarial Training {}".format(adv_training))
-
-        minibatch_counter = 0
-        for data in datasets["loader_tr"]:
-
-            # print("Training with minibatch ", minibatch_counter)
-            (experiment, treatment, control, _, covariates)= \
-            (data[0], data[1], data[2], data[3], data[4:])
-
-            # Check dimensions of inputs
-            # print("Experiment dimensions: ", experiment.shape)
-            # print("Treatment dimensions: ", treatment.shape)
-            # print("Control dimensions: ", control.shape)
-            # print("Covariates dimensions: ", [cov.shape for cov in covariates])
-
-            minibatch_training_stats = model.update(
-                experiment, treatment, control, covariates, optimizer_autoencoder, optimizer_discriminator, adv_training
-            )
-            
-            minibatch_counter += 1
-            
-            ## Legacy code for training with divergence 
-            # minibatch_training_stats = model.update_divergence(
-            #     experiment, treatment, control, covariates, adv_training)
-
-            for key, val in minibatch_training_stats.items():
-                epoch_training_stats[key] += val
-        model.update_eval_encoder()
-
-        for key, val in epoch_training_stats.items():
-            epoch_training_stats[key] = val / len(datasets["loader_tr"])
-            if not (key in model.history.keys()):
-                model.history[key] = []
-            model.history[key].append(epoch_training_stats[key])
-        model.history["epoch"].append(epoch)
-
-        ellapsed_minutes = (time.time() - start_time) / 60
-        model.history["elapsed_time_min"] = ellapsed_minutes
-
-        # decay learning rate if necessary
-        # also check stopping condition: 
-        # patience ran out OR max epochs reached
-        stop = (epoch == args["max_epochs"] - 1)
-
-        if (epoch % args["checkpoint_freq"]) == 0 or stop:
-            evaluation_stats = evaluate_prediction(model, datasets)
-            for key, val in evaluation_stats.items():
-                if not (key in model.history.keys()):
-                    model.history[key] = []
-                model.history[key].append(val)
-            model.history["stats_epoch"].append(epoch)
-
-            # Only rank 0 process logs and saves model
-            if log_proc:
-                ljson(
-                    {
-                        "epoch": epoch,
-                        "training_stats": epoch_training_stats,
-                        "evaluation_stats": evaluation_stats,
-                        "ellapsed_minutes": ellapsed_minutes,
-                        "Discriminator Training": adv_training
-                    }
-                )
-
-                # Log stats to WandB
-                all_stats = {}
-                for stat, value in epoch_training_stats.items():
-                    all_stats[stat] = value
-                
-                for stat, value in evaluation_stats.items():
-                    all_stats[stat] = value
-
-                all_stats["ellapsed_minutes"] = ellapsed_minutes
-                all_stats["R2 Score Train (Mean)"] = evaluation_stats["train"][0]
-                all_stats["R2 Score Train (Stddev)"] = evaluation_stats["train"][1]
-                all_stats["R2 Score Test (Mean)"] = evaluation_stats["test"][0]
-                all_stats["R2 Score Test (Stddev)"] = evaluation_stats["test"][1]
-
-                wandb.log(all_stats)
-
-                for key, val in epoch_training_stats.items():
-                    writer.add_scalar(key, val, epoch)
-
-                torch.save(
-                    (model.state_dict(), args, model.history),
-                    os.path.join(
-                        save_dir,
-                        "model_seed={}_epoch={}.pt".format(args["seed"], epoch),
-                    ),
-                )
-
-                ljson(
-                    {
-                        "model_saved": "model_seed={}_epoch={}.pt\n".format(
-                            args["seed"], epoch
-                        )
-                    }
-                )
-
-            # Step schedulers and check early stopping
-            stop = stop or model.early_stopping(evaluation_stats["test"][0], scheduler_autoencoder, scheduler_discriminator)
-            if stop:
-                ljson({"early_stop": epoch})
-                break
-
-     # Rank 0 plots UMAPS
-    if log_proc:
-        plot_umaps(model_dir=args["artifact_path"], all_drugs=False)
-        # plot_progression(model_dir=args["artifact_path"], rep="ZXs", feature="cell_name", freq=100)
-        # plot_progression(model_dir=args["artifact_path"], rep="ZTs", feature="dose", freq=100)
-
-        writer.close()
-
-    return 
-
 
 def train(args, prepare=prepare, state_dict=None):
     """
@@ -294,10 +149,12 @@ def train(args, prepare=prepare, state_dict=None):
         model, datasets = prepare(args, world_size, rank, local_rank)
 
     # Setup DDP model
-    ddp_model = DDP(model, device_ids=[local_rank])
+    model.to(local_rank)
+    model.device = torch.device(local_rank)
+    ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     optimizer_autoencoder = optim.Adam(ddp_model.module.params_autoencoder,
-                                       lr=args["learning_rate"],
+                                       lr=args["hparams"]["autoencoder_lr"],
                                        weight_decay=args["hparams"]["autoencoder_wd"]
                                        )
     scheduler_autoencoder = torch.optim.lr_scheduler.StepLR(
@@ -305,7 +162,7 @@ def train(args, prepare=prepare, state_dict=None):
     )
 
     optimizer_discriminator = optim.Adam(ddp_model.module.params_discriminator,
-                                       lr=args["learning_rate"],
+                                       lr=args["hparams"]["discriminator_lr"],
                                        weight_decay=args["hparams"]["discriminator_wd"]
                                        )
     scheduler_discriminator = torch.optim.lr_scheduler.StepLR(
@@ -320,4 +177,200 @@ def train(args, prepare=prepare, state_dict=None):
               scheduler_autoencoder, scheduler_discriminator)
 
     return
+
+
+def train_ddp(model, args, datasets, log_proc, 
+              optimizer_autoencoder, optimizer_discriminator,
+              scheduler_autoencoder, scheduler_discriminator):
+    """
+    Trains a FCR model with DDP
+    """
+    # Setup logging (only rank 0 process log)
+    if log_proc:
+        wandb.init(config=args, project=args["name"], name=args["experiment"])
+        # wandb.watch(model, log_freq=10) # Disabled for the moment for DDP setup
+
+        dt = datetime.now().strftime("%Y.%m.%d_%H:%M:%S")
+        writer = SummaryWriter(log_dir=os.path.join(args["artifact_path"], "runs/" + args["name"] + "_" + dt))
+        save_dir = os.path.join(args["artifact_path"], "saves/" + args["name"] + "_" + dt)
+        os.makedirs(save_dir, exist_ok=True)
+
+        initialize_logger(save_dir)
+        ljson({"training_args": args})
+        ljson({"model_params": model.module.hparams})
+        logging.info("")
+
+    start_time = time.time()
+    
+    # Set static graph to help DDP with alternating optimizer pattern
+    # Uncompatible for changing training like the one we implement here
+    # model._set_static_graph()
+    # if log_proc:
+    #     print("DDP static graph set")
+
+    for epoch in range(args["max_epochs"]):
+        # Activate training mode
+        model.train()
+        
+        # Set epoch for DistributedSampler to reshuffle differently each epoch
+        datasets["loader_tr"].sampler.set_epoch(epoch)
+
+        # Clear between epochs
+        if epoch > 0:
+            loss = loss.detach()
+            optimizer_autoencoder.zero_grad(set_to_none=True)
+            optimizer_discriminator.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+        
+        epoch_training_stats = defaultdict(float)
+        if epoch % args["adv_epoch"]==0:
+            adv_training=True
+        else:
+            adv_training=False
+        # print("Adversarial Training {}".format(adv_training))
+
+        minibatch_counter = 0
+        for data in datasets["loader_tr"]:
+
+            # print("Training with minibatch ", minibatch_counter)
+            (experiment, treatment, control, _, covariates)= \
+            (data[0], data[1], data[2], data[3], data[4:])
+
+            # Check dimensions of inputs
+            # print("Experiment dimensions: ", experiment.shape)
+            # print("Treatment dimensions: ", treatment.shape)
+            # print("Control dimensions: ", control.shape)
+            # print("Covariates dimensions: ", [cov.shape for cov in covariates])
+
+            # Forward pass through DDP wrapper
+            control_outcomes_dist, expr_outcomes_dist, exp_dist, ZX_constr, ZT_constr, ZXT_constr, \
+            ZX_prior_dist, ZT_prior_dist, ZXT_prior_dist, control_latents_dist, control_prior_dist, \
+            cov_constr, treatment_constr, sim_loss, sim_t, sim_x, permute_T_pred, permute_X_pred, perturb_T, perturb_X = model(
+                experiment, treatment, control, covariates, adv_training=adv_training, sample_latent=args["hparams"]["sample_latent"]
+            )
+
+            loss, minibatch_training_stats = model.module.compute_loss(
+                control, experiment, treatment, covariates, \
+                control_outcomes_dist, expr_outcomes_dist, exp_dist, ZX_constr, ZT_constr, ZXT_constr, \
+                ZX_prior_dist, ZT_prior_dist, ZXT_prior_dist, control_latents_dist, control_prior_dist, \
+                cov_constr, treatment_constr, sim_loss, sim_t, sim_x, permute_T_pred, permute_X_pred, \
+                perturb_T, perturb_X, adv_training
+            )
+            
+            # Backward pass and optimization step
+            # CRITICAL for DDP: Zero BOTH optimizers before backward to ensure consistent gradient state
+            optimizer_autoencoder.zero_grad()
+            optimizer_discriminator.zero_grad()
+            
+            # Single backward pass (marks all params ready once)
+            loss.backward()
+            
+            # Step only the relevant optimizer based on training phase
+            if not adv_training:
+                optimizer_autoencoder.step()
+            else:
+                optimizer_discriminator.step()
+
+            # Logging
+            minibatch_counter += 1
+            if (minibatch_counter % 10) == 0 and log_proc:
+                print(f"Epoch {epoch} - Minibatch {minibatch_counter}")
+
+            for key, val in minibatch_training_stats.items():
+                epoch_training_stats[key] += val
+        
+        print("\n EPOCH COMPLETED\n")
+
+        for key, val in epoch_training_stats.items():
+            epoch_training_stats[key] = val / len(datasets["loader_tr"])
+            if not (key in model.module.history.keys()):
+                model.module.history[key] = []
+            model.module.history[key].append(epoch_training_stats[key])
+        model.module.history["epoch"].append(epoch)
+
+        ellapsed_minutes = (time.time() - start_time) / 60
+        model.module.history["elapsed_time_min"] = ellapsed_minutes
+
+        # decay learning rate if necessary
+        # also check stopping condition: 
+        # patience ran out OR max epochs reached
+        stop = (epoch == args["max_epochs"] - 1)
+
+        evaluate_model = True
+
+        if ((epoch % args["checkpoint_freq"]) == 0 or stop) and evaluate_model:
+            print("Performing evaluation...")
+            # Activate evaluation mode
+            model.eval()
+
+            evaluation_stats = evaluate_prediction(model.module, datasets)
+            for key, val in evaluation_stats.items():
+                if not (key in model.module.history.keys()):
+                    model.module.history[key] = []
+                model.module.history[key].append(val)
+            model.module.history["stats_epoch"].append(epoch)
+
+            # Only rank 0 process logs and saves model
+            if log_proc:
+                ljson(
+                    {
+                        "epoch": epoch,
+                        "training_stats": epoch_training_stats,
+                        "evaluation_stats": evaluation_stats,
+                        "ellapsed_minutes": ellapsed_minutes,
+                        "Discriminator Training": adv_training
+                    }
+                )
+
+                # Log stats to WandB
+                all_stats = {}
+                for stat, value in epoch_training_stats.items():
+                    all_stats[stat] = value
+                
+                for stat, value in evaluation_stats.items():
+                    all_stats[stat] = value
+
+                all_stats["ellapsed_minutes"] = ellapsed_minutes
+                all_stats["R2 Score Train (Mean)"] = evaluation_stats["train"][0]
+                all_stats["R2 Score Train (Stddev)"] = evaluation_stats["train"][1]
+                all_stats["R2 Score Test (Mean)"] = evaluation_stats["test"][0]
+                all_stats["R2 Score Test (Stddev)"] = evaluation_stats["test"][1]
+
+                wandb.log(all_stats)
+
+                for key, val in epoch_training_stats.items():
+                    writer.add_scalar(key, val, epoch)
+
+                torch.save(
+                    (model.module.state_dict(), args, model.module.history),
+                    os.path.join(
+                        save_dir,
+                        "model_seed={}_epoch={}.pt".format(args["seed"], epoch),
+                    ),
+                )
+
+                ljson(
+                    {
+                        "model_saved": "model_seed={}_epoch={}.pt\n".format(
+                            args["seed"], epoch
+                        )
+                    }
+                )
+
+            # Step schedulers and check early stopping
+            stop = stop or model.module.early_stopping(evaluation_stats["test"][0], scheduler_autoencoder, scheduler_discriminator)
+            if stop:
+                ljson({"early_stop": epoch})
+                break
+
+     # Rank 0 plots UMAPS
+    if log_proc:
+        print("Need to modify UMAP plotting before implementing...")
+        # plot_umaps(model_dir=args["artifact_path"], all_drugs=False)
+        # plot_progression(model_dir=args["artifact_path"], rep="ZXs", feature="cell_name", freq=100)
+        # plot_progression(model_dir=args["artifact_path"], rep="ZTs", feature="dose", freq=100)
+
+        writer.close()
+
+    return 
 

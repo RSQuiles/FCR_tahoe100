@@ -207,8 +207,8 @@ def evaluate_r2_classic(model, dataset, dataset_control, batch_size=None, min_sa
         for s in [mean_score, mean_score_de]
     ]
 
-
-def evaluate_prediction(model, datasets, batch_size=None):
+# ADDED: eval flag enables the usage of the "eval" model, so that the original model is not used (crucial for DDP implementation)
+def evaluate_prediction(model, datasets, batch_size=None, eval=False):
     """
     `evaluate` used in CPA
     https://github.com/facebookresearch/CPA
@@ -220,18 +220,20 @@ def evaluate_prediction(model, datasets, batch_size=None):
             "train": evaluate_prediction_r2(
                 model,
                 datasets["train"].subset_condition(control=False),
-                batch_size=batch_size
+                batch_size=batch_size,
+                eval=eval
             ),
             "test": evaluate_prediction_r2(
                 model,
                 datasets["test"].subset_condition(control=False),
-                batch_size=batch_size
+                batch_size=batch_size,
+                eval=eval
             )
         }
     return evaluation_stats
 
 
-def evaluate_prediction_r2(model, dataset, batch_size=None, min_samples=30):
+def evaluate_prediction_r2(model, dataset, batch_size=None, min_samples=30, eval=False):
     """
     `evaluate_r2` used in CPA
     https://github.com/facebookresearch/CPA
@@ -261,7 +263,8 @@ def evaluate_prediction_r2(model, dataset, batch_size=None, min_samples=30):
             out = model.predict_self(
                     genes,
                     perts,
-                    [covar for covar in covars]
+                    [covar for covar in covars],
+                    eval = eval
                 )
             
             yp = out.detach().cpu()
