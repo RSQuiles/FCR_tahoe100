@@ -13,19 +13,28 @@ import re
 import math
 import matplotlib.colors as mcolors
 
-def compute_latents(trained_model, datasets, adata, sample=False):
+def compute_latents(trained_model, datasets, adata, batch_size, sample=False, max_samples=1e5):
     print("Computing latent representations...")
+    indices = []
     ZXs = []
     ZTs = []
     ZXTs = []
-    for data in datasets["loader_tr"]:
-        (genes, perts, cf_genes, cf_perts, covariates) = (
-                data[0], data[1], data[2], data[3], data[4:])
 
-        ZX, ZXT, ZT = trained_model.get_latent_presentation(genes, perts, covariates, sample=sample)
-        ZXs.extend(ZX)
-        ZTs.extend(ZT)
-        ZXTs.extend(ZXT)
+    trained_model.eval()
+    with torch.no_grad():
+        for i, data in enumerate(datasets["loader_tr"]):
+            if batch_size * i < max_samples:
+                (genes, perts, cf_genes, idx, _, covariates) = (
+                        data[0], data[1], data[2], data[3], data[4], data[5:])
+
+                ZX, ZXT, ZT = trained_model.get_latent_presentation(genes, perts, covariates, sample=sample)
+                ZXs.extend(ZX)
+                ZTs.extend(ZT)
+                ZXTs.extend(ZXT)
+                indices.append(idx.item())
+
+            else:
+                break
 
     ZXs = [e.detach().cpu().numpy() for e in ZXs]
     ZXs = np.array(ZXs)
@@ -37,15 +46,17 @@ def compute_latents(trained_model, datasets, adata, sample=False):
     ZTs = np.array(ZTs)
     # print("ZT mean:", ZTs.mean(), "ZT std:", ZTs.std())
 
-    # Append to adata
-    adata.obsm["ZXs"] = ZXs
-    adata.obsm["ZTs"] = ZTs
-    adata.obsm["ZXTs"] = ZXTs
+    # Subset AnnData according to indices
+    adata_subset = adata[indices].copy()
+    adata_subset.obsm["ZXs"] = ZXs
+    adata_subset.obsm["ZTs"] = ZTs
+    adata_subset.obsm["ZXTs"] = ZXTs
 
     # Export to avoid computing again
     # adata.write(args["data_path"])    
 
-    return
+    return adata_subset
+
 
 def raw_umap(adata,
              feature,
@@ -84,6 +95,7 @@ def raw_umap(adata,
 
     return figure
 
+
 def umap(adata,
          rep,
          return_fig,
@@ -121,6 +133,7 @@ def umap(adata,
     )
 
     return figure
+
 
 def filter_adata(adata, filter_dict):
     """
@@ -164,7 +177,7 @@ def filter_adata(adata, filter_dict):
     return [adata_sub, filter_suffix]
 
 
-def plot_umaps(model_dir, target_epoch=None, filter_dict=None, all_drugs=False, sample=False):
+def plot_umaps(model_dir, target_epoch=None, filter_dict=None, all_drugs=False, sample=False, show_figs=False):
     """
     Plot UMAPs for FCR latent representations.
     
@@ -190,10 +203,16 @@ def plot_umaps(model_dir, target_epoch=None, filter_dict=None, all_drugs=False, 
     output_dir = str(os.path.join(model_dir, "umaps"))
     os.makedirs(output_dir, exist_ok=True)
 
-    adata = sc.read(args["data_path"])
+    adata = sc.read(args["data_path"], backed="r")
+    # Set batch size to determine number of samples to process
+    batch_size = 256
+    try:
+        batch_size = model.batch_size
+    except:
+        pass
 
     # Append latents to adata
-    compute_latents(model, datasets, adata, sample=sample)
+    adata = compute_latents(model, datasets, adata, batch_size, sample=sample)
 
     # Apply filters if provided
     if filter_dict is not None:
@@ -205,20 +224,29 @@ def plot_umaps(model_dir, target_epoch=None, filter_dict=None, all_drugs=False, 
     # Plot ZX
     print("Plotting ZX UMAP...")
     fig = umap(adata, rep="ZXs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
-    fig.savefig(os.path.join(output_dir,"UMAP_ZXs.png"), dpi=300, bbox_inches="tight")
+    if show_figs:
+        plt.show()
+    else:
+        fig.savefig(os.path.join(output_dir,"UMAP_ZXs.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
     # Plot ZXT
     print("Plotting ZXT UMAP...")
     fig = umap(adata, rep="ZXTs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
-    fig.savefig(os.path.join(output_dir,f"UMAP_ZXTs.png"), dpi=300, bbox_inches="tight")
+    if show_figs:
+        plt.show()
+    else:
+        fig.savefig(os.path.join(output_dir,f"UMAP_ZXTs.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
     if not all_drugs:
         # Plot ZT
         print("Plotting ZT UMAP...")
         fig = umap(adata_sub, rep="ZTs", color=["dose", "Agg_Treatment", "cell_name"], return_fig=True)
-        fig.savefig(os.path.join(output_dir,f"UMAP_ZTs{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+        if show_figs:
+            plt.show()
+        else:
+            fig.savefig(os.path.join(output_dir,f"UMAP_ZTs{filter_suffix}.png"), dpi=300, bbox_inches="tight")
         plt.close()
         
     # Option: print ZT against all drugs
@@ -229,19 +257,31 @@ def plot_umaps(model_dir, target_epoch=None, filter_dict=None, all_drugs=False, 
             filter_dict = {"Agg_Treatment": [drug, "DMSO_TF"]}
             adata_sub, filter_suffix = filter_adata(adata, filter_dict)
             fig = umap(adata_sub, rep="ZTs", color=["dose", "Agg_Treatment", "cell_name"], return_fig=True)
-            fig.savefig(os.path.join(output_dir,f"UMAP_ZTs_{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+            if show_figs:
+                plt.show()
+            else:
+                fig.savefig(os.path.join(output_dir,f"UMAP_ZTs_{filter_suffix}.png"), dpi=300, bbox_inches="tight")
             plt.close()
 
     # Plot before FCR
     print("Plotting raw UMAPs...")
     fig = raw_umap(adata, feature="cell_name")
-    fig.savefig(os.path.join(output_dir,f"UMAP_cell_name.png"), dpi=300, bbox_inches="tight")
+    if show_figs:
+        plt.show()
+    else:
+        fig.savefig(os.path.join(output_dir,f"UMAP_cell_name.png"), dpi=300, bbox_inches="tight")
 
     fig = raw_umap(adata, feature="Agg_Treatment")
-    fig.savefig(os.path.join(output_dir,"UMAP_treatment.png"), dpi=300, bbox_inches="tight")
+    if show_figs:
+        plt.show()
+    else:
+        fig.savefig(os.path.join(output_dir,"UMAP_treatment.png"), dpi=300, bbox_inches="tight")
 
     fig = raw_umap(adata_sub, feature="dose")
-    fig.savefig(os.path.join(output_dir,f"UMAP_dose{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+    if show_figs:
+        plt.show()
+    else:
+        fig.savefig(os.path.join(output_dir,f"UMAP_dose{filter_suffix}.png"), dpi=300, bbox_inches="tight")
 
 
 def plot_progression(model_dir, rep, feature, last_epoch=None, freq=50, n_cols=5):
@@ -273,7 +313,7 @@ def plot_progression(model_dir, rep, feature, last_epoch=None, freq=50, n_cols=5
 
     # Import AnnData
     args, model, datasets = get_model(model_dir)
-    adata = sc.read(args["data_path"])
+    adata = sc.read(args["data_path"], backed="r") # Backed mode to avoid memory issues
 
     for i, ax in enumerate(axes):
         if target_epoch > last_epoch:
@@ -287,7 +327,14 @@ def plot_progression(model_dir, rep, feature, last_epoch=None, freq=50, n_cols=5
         else:
             retrieved = get_model(model_dir, target_epoch)
             args, model, datasets  = retrieved[0], retrieved[1], retrieved[2]
-            compute_latents(model, datasets, adata)
+            # Set batch size to determine number of samples to process
+            batch_size = 256
+            try:
+                batch_size = model.batch_size
+            except:
+                pass
+
+            adata = compute_latents(model, datasets, adata, batch_size)
 
             f = umap(adata, rep=rep, return_fig=False, ax=ax, title=f"Epoch {target_epoch}")
 

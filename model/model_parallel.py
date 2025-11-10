@@ -87,7 +87,7 @@ class FCR(nn.Module):
         type_treatments=None,
         type_covariates=None, # If None, "object", "bool" or "category", embedding is done with Compound Embedding, else, with MLP
         mc_sample_size=30,
-        best_score=-1e3,
+        best_score=None,
         patience=5,
         distance="element",
         device="cuda",
@@ -115,12 +115,14 @@ class FCR(nn.Module):
         self.omega3 = omega3
         self.omega4 = omega4
         self.dist_mode = dist_mode
-        # early-stopping
+
+        # Early stopping
         self.best_score = best_score
         self.patience = patience
         self.patience_trials = 0
         self.distance = distance
         # set hyperparameters
+        self.batch_size = batch_size
         self._set_hparams_(hparams)
 
         ## modified: adapt for non-sampling case
@@ -955,9 +957,7 @@ class FCR(nn.Module):
 
         return (indiv_spec_nllh, covar_spec_nllh, kl_divergence)
     
-    ## control_outcomes, control_outcomes_dist_samp, expr_outcomes, expr_outcomes_dist_samp, exp_dist,
-    ## ZX, ZT, ZXT, ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_prior_dist, control_latents_dist,
-    ### cov_constr, treatment_constr, treatments,covariates
+
     def loss_paired(self, control_outcomes, control_outcomes_dist_samp,
             expr_outcomes, expr_outcomes_dist_samp, exp_dist, ZX_dist, ZT_dist, ZXT_dist,
             ZX_prior_dist, ZT_prior_dist, ZXT_prior_dist, control_prior_dist,control_latents_dist,
@@ -1005,9 +1005,14 @@ class FCR(nn.Module):
         # 3) Reconstruction loss of covariates from ZX 
         cross_entropy_loss = nn.CrossEntropyLoss()
         cov_loss = 0.0
+        # print(f"cov_constr.shape: {cov_constr.shape}")
+        # Note covariates should be a list of tensors, one per covariate
         for i in range(len(covariates)):
+            # print(f"len(covariates): {len(covariates)}")
+            # print(f"cov_constr[...,i].shape: {cov_constr[...,i].shape}")
+            # print(f"covariates[i].shape: {covariates[i].shape}")
             cov_loss = cov_loss + cross_entropy_loss(cov_constr[...,i],covariates[i].squeeze())
-    
+
         # 4) Reconstruction loss of treatments from (ZTs, ZTs_control)
         treatment_loss = cross_entropy_loss(treatment_constr.squeeze(),torch.argmax(treatments, 1))
 
@@ -1267,69 +1272,27 @@ class FCR(nn.Module):
         expr_outcomes_dist = self.distributionize(expr_outcomes_constr)
 
         # Use discriminator in forward pass to ensure compatibility with DDP
-        cov_conditions = covariates = torch.cat(covariates, dim=1)
+        cov_conditions = torch.cat(covariates, dim=1)
         
         perturb_X = self.permutation_distribution_X(exp_dist.mean, exp_dist.stddev,cov_conditions)
         perturb_T = self.permutation_distribution_T(exp_dist.mean, exp_dist.stddev,treatments)
 
-        if not adv_training:
-            self.freeze_discriminator(True)
-
         permute_T_pred = self.discriminate_T(perturb_T[:, :-1])
         permute_X_pred = self.discriminate_X(perturb_X[:, :-1])
 
-        if not adv_training:
-            self.freeze_discriminator(False)
-
-        results = [
-            control_outcomes_dist, # distribution for control outcomes
-            expr_outcomes_dist,    # distribution for treated outcomes
-            exp_dist,                   # distribution for treated latents
-            ZX_constr,
-            ZT_constr,
-            ZXT_constr,
-            ZX_prior_dist,
-            ZT_prior_dist,
-            ZXT_prior_dist,
-            control_latents_dist,       # distribution for control latents
-            control_prior_dist,         # prior distribution for control latents
-            cov_constr,
-            treatment_constr,
-            sim_loss,
-            sim_t,
-            sim_x,
-            permute_T_pred,
-            permute_X_pred,
-            perturb_T,
-            perturb_X,
-        ]
-            
-        return results
-
-    def compute_loss(self, control_outcomes, expr_outcomes, treatments, covariates, control_outcomes_dist_samp, \
-                     expr_outcomes_dist_samp, exp_dist, ZX, ZT, ZXT, \
-                    ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_latents_dist, control_prior_dist, \
-                    cov_constr, treatment_constr, sim_loss, sim_t, sim_x, permute_T_pred, permute_X_pred, perturb_T, perturb_X,
-                    adv_training=False):
-        """
-        Compute and return loss given the module's output
-        """
-
-        # Move inputs to device
-        control_outcomes, expr_outcomes, treatments, covariates = self.move_inputs(
-            control_outcomes, expr_outcomes, treatments, covariates
-        )
-
+        # COMPUTE LOSS TERMS
         indiv_spec_nllh_control, indiv_spec_nllh_experiments, cov_loss, treatment_loss,\
-        kl_divergence_ind, kl_divergence_X, kl_divergence_T, kl_divergence_XT,kl_divergence_control, conditions, conditions_labels= \
-        self.loss_paired(control_outcomes, control_outcomes_dist_samp, expr_outcomes, expr_outcomes_dist_samp, exp_dist,
-                        ZX, ZT, ZXT, ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_prior_dist, control_latents_dist,
+        kl_divergence_ind, kl_divergence_X, kl_divergence_T, kl_divergence_XT,kl_divergence_control, conditions, conditions_labels = \
+        self.loss_paired(control_outcomes, control_outcomes_dist, outcomes, expr_outcomes_dist, exp_dist,
+                        ZX_constr, ZT_constr, ZXT_constr, ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_prior_dist, control_latents_dist,
                         cov_constr, treatment_constr, treatments,covariates)
 
                 
         permute_T_loss = self.loss_discriminator_T(permute_T_pred, perturb_T[:, -1]) 
         permute_X_loss = self.loss_discriminator_X(permute_X_pred, perturb_X[:, -1])
         permute_loss =  0.5 * (permute_T_loss + permute_X_loss)
+
+        # ORGANIZE LOSS AND LOGGING METRICS
 
         indiv_spec_nllh = indiv_spec_nllh_control + indiv_spec_nllh_experiments
         # Include causal structure regularizer
@@ -1374,14 +1337,18 @@ class FCR(nn.Module):
                 target_param.data.copy_(param.data)
                     
 
-    def early_stopping(self, score, scheduler_autoencoder, scheduler_discriminator):
+    # Added: increase specified whether the metric should increase or decrease during training
+    def early_stopping(self, score, scheduler_autoencoder, scheduler_discriminator, increase=True):
         """
         Decays the learning rate, and possibly early-stops training.
         """
         scheduler_autoencoder.step()
         scheduler_discriminator.step()
 
-        if score > self.best_score:
+        if self.best_score is None:
+            self.best_score = -float("inf") if increase else float("inf")
+
+        if (score > self.best_score and increase) or (score < self.best_score and not increase):
             self.best_score = score
             self.patience_trials = 0
         else:

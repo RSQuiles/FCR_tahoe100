@@ -28,6 +28,8 @@ from ..utils.data_utils import data_collate
 from ..validation import plot_umaps
 from ..validation import plot_progression
 
+torch.autograd.set_detect_anomaly(True)
+
 ## modified: add split to select desired datastet
 def prepare(args, world_size, rank, local_rank, state_dict=None, split_name="train"):
     """
@@ -84,6 +86,7 @@ def prepare(args, world_size, rank, local_rank, state_dict=None, split_name="tra
                                                                     shuffle=False
                                                                     )
     
+    print(f"Number of workers: ", {os.environ["SLURM_CPUS_PER_TASK"]})
     datasets.update(
         {
             "loader_tr": torch.utils.data.DataLoader(
@@ -91,6 +94,9 @@ def prepare(args, world_size, rank, local_rank, state_dict=None, split_name="tra
                 batch_size=args["batch_size"],
                 sampler=train_sampler,
                 num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]),
+                prefetch_factor=2,
+                pin_memory = True,
+                persistent_workers=True,
                 collate_fn=(lambda batch: data_collate(batch, nb_dims=1))
             )
         }
@@ -211,19 +217,15 @@ def train_ddp(model, args, datasets, log_proc,
     for epoch in range(args["max_epochs"]):
         # Activate training mode
         model.train()
-        
+
+        # Determine epoch time
+        epoch_start_time = time.time()
+
         # Set epoch for DistributedSampler to reshuffle differently each epoch
         datasets["loader_tr"].sampler.set_epoch(epoch)
-
-        # Clear between epochs
-        if epoch > 0:
-            loss = loss.detach()
-            optimizer_autoencoder.zero_grad(set_to_none=True)
-            optimizer_discriminator.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
         
         epoch_training_stats = defaultdict(float)
-        if epoch % args["adv_epoch"]==0:
+        if (epoch % args["adv_epoch"]) == 0:
             adv_training=True
         else:
             adv_training=False
@@ -233,36 +235,29 @@ def train_ddp(model, args, datasets, log_proc,
         for data in datasets["loader_tr"]:
 
             # print("Training with minibatch ", minibatch_counter)
-            (experiment, treatment, control, _, covariates)= \
-            (data[0], data[1], data[2], data[3], data[4:])
+            (experiment, treatment, control, _, _, covariates)= \
+            (data[0], data[1], data[2], data[3], data[4], data[5:])
 
-            # Check dimensions of inputs
-            # print("Experiment dimensions: ", experiment.shape)
-            # print("Treatment dimensions: ", treatment.shape)
-            # print("Control dimensions: ", control.shape)
-            # print("Covariates dimensions: ", [cov.shape for cov in covariates])
+            # Freeze the discriminator if adv_training
+            if not adv_training:
+                model.module.freeze_discriminator(True)
 
             # Forward pass through DDP wrapper
-            control_outcomes_dist, expr_outcomes_dist, exp_dist, ZX_constr, ZT_constr, ZXT_constr, \
-            ZX_prior_dist, ZT_prior_dist, ZXT_prior_dist, control_latents_dist, control_prior_dist, \
-            cov_constr, treatment_constr, sim_loss, sim_t, sim_x, permute_T_pred, permute_X_pred, perturb_T, perturb_X = model(
-                experiment, treatment, control, covariates, adv_training=adv_training, sample_latent=args["hparams"]["sample_latent"]
-            )
-
-            loss, minibatch_training_stats = model.module.compute_loss(
-                control, experiment, treatment, covariates, \
-                control_outcomes_dist, expr_outcomes_dist, exp_dist, ZX_constr, ZT_constr, ZXT_constr, \
-                ZX_prior_dist, ZT_prior_dist, ZXT_prior_dist, control_latents_dist, control_prior_dist, \
-                cov_constr, treatment_constr, sim_loss, sim_t, sim_x, permute_T_pred, permute_X_pred, \
-                perturb_T, perturb_X, adv_training
+            loss, minibatch_training_stats = \
+            model(
+                experiment, 
+                treatment, 
+                control, 
+                covariates, 
+                adv_training=adv_training, 
+                sample_latent=args["hparams"]["sample_latent"]
             )
             
             # Backward pass and optimization step
-            # CRITICAL for DDP: Zero BOTH optimizers before backward to ensure consistent gradient state
             optimizer_autoencoder.zero_grad()
             optimizer_discriminator.zero_grad()
             
-            # Single backward pass (marks all params ready once)
+            # Single backward pass
             loss.backward()
             
             # Step only the relevant optimizer based on training phase
@@ -271,16 +266,21 @@ def train_ddp(model, args, datasets, log_proc,
             else:
                 optimizer_discriminator.step()
 
-            # Logging
+            # Unfreeze discriminator after iteration
+            if not adv_training:
+                model.module.freeze_discriminator(True)
+
             minibatch_counter += 1
+
+            # Logging minibatches
             if (minibatch_counter % 10) == 0 and log_proc:
                 print(f"Epoch {epoch} - Minibatch {minibatch_counter}")
+                print(f"Minibatch rate: {(time.time() - epoch_start_time)/minibatch_counter} sec")
 
             for key, val in minibatch_training_stats.items():
                 epoch_training_stats[key] += val
-        
-        print("\n EPOCH COMPLETED\n")
 
+        # Average epoch stats over number of minibatches
         for key, val in epoch_training_stats.items():
             epoch_training_stats[key] = val / len(datasets["loader_tr"])
             if not (key in model.module.history.keys()):
@@ -296,10 +296,9 @@ def train_ddp(model, args, datasets, log_proc,
         # patience ran out OR max epochs reached
         stop = (epoch == args["max_epochs"] - 1)
 
-        evaluate_model = True
-
-        if ((epoch % args["checkpoint_freq"]) == 0 or stop) and evaluate_model:
-            print("Performing evaluation...")
+        # Only rank 0 process logs, saves the model checkpoint and performs evaluation
+        if ((epoch % args["checkpoint_freq"]) == 0 or stop) and log_proc:
+            # print("Performing evaluation...")
             # Activate evaluation mode
             model.eval()
 
@@ -310,63 +309,61 @@ def train_ddp(model, args, datasets, log_proc,
                 model.module.history[key].append(val)
             model.module.history["stats_epoch"].append(epoch)
 
-            # Only rank 0 process logs and saves model
-            if log_proc:
-                ljson(
-                    {
-                        "epoch": epoch,
-                        "training_stats": epoch_training_stats,
-                        "evaluation_stats": evaluation_stats,
-                        "ellapsed_minutes": ellapsed_minutes,
-                        "Discriminator Training": adv_training
-                    }
-                )
+            ljson(
+                {
+                    "epoch": epoch,
+                    "training_stats": epoch_training_stats,
+                    "evaluation_stats": evaluation_stats,
+                    "ellapsed_minutes": ellapsed_minutes,
+                    "Discriminator Training": adv_training
+                }
+            )
 
-                # Log stats to WandB
-                all_stats = {}
-                for stat, value in epoch_training_stats.items():
-                    all_stats[stat] = value
-                
-                for stat, value in evaluation_stats.items():
-                    all_stats[stat] = value
+            # Log stats to WandB
+            all_stats = {}
+            for stat, value in epoch_training_stats.items():
+                all_stats[stat] = value
+            
+            for stat, value in evaluation_stats.items():
+                all_stats[stat] = value
 
-                all_stats["ellapsed_minutes"] = ellapsed_minutes
-                all_stats["R2 Score Train (Mean)"] = evaluation_stats["train"][0]
-                all_stats["R2 Score Train (Stddev)"] = evaluation_stats["train"][1]
-                all_stats["R2 Score Test (Mean)"] = evaluation_stats["test"][0]
-                all_stats["R2 Score Test (Stddev)"] = evaluation_stats["test"][1]
+            all_stats["ellapsed_minutes"] = ellapsed_minutes
+            all_stats["R2 Score Train (Mean)"] = evaluation_stats["train"][0]
+            all_stats["R2 Score Train (Stddev)"] = evaluation_stats["train"][1]
+            all_stats["R2 Score Test (Mean)"] = evaluation_stats["test"][0]
+            all_stats["R2 Score Test (Stddev)"] = evaluation_stats["test"][1]
 
-                wandb.log(all_stats)
+            wandb.log(all_stats)
 
-                for key, val in epoch_training_stats.items():
-                    writer.add_scalar(key, val, epoch)
+            for key, val in epoch_training_stats.items():
+                writer.add_scalar(key, val, epoch)
 
-                torch.save(
-                    (model.module.state_dict(), args, model.module.history),
-                    os.path.join(
-                        save_dir,
-                        "model_seed={}_epoch={}.pt".format(args["seed"], epoch),
-                    ),
-                )
+            torch.save(
+                (model.module.state_dict(), args, model.module.history),
+                os.path.join(
+                    save_dir,
+                    "model_seed={}_epoch={}.pt".format(args["seed"], epoch),
+                ),
+            )
 
-                ljson(
-                    {
-                        "model_saved": "model_seed={}_epoch={}.pt\n".format(
-                            args["seed"], epoch
-                        )
-                    }
-                )
+            ljson(
+                {
+                    "model_saved": "model_seed={}_epoch={}.pt\n".format(
+                        args["seed"], epoch
+                    )
+                }
+            )
 
-            # Step schedulers and check early stopping
-            stop = stop or model.module.early_stopping(evaluation_stats["test"][0], scheduler_autoencoder, scheduler_discriminator)
-            if stop:
-                ljson({"early_stop": epoch})
-                break
+        # Step schedulers and check early stopping
+        stop = stop or model.module.early_stopping(epoch_training_stats["KL Divergence"], scheduler_autoencoder, scheduler_discriminator)
+        if stop:
+            ljson({"early_stop": epoch})
+            break
 
      # Rank 0 plots UMAPS
     if log_proc:
-        print("Need to modify UMAP plotting before implementing...")
-        # plot_umaps(model_dir=args["artifact_path"], all_drugs=False)
+        print("Working on UMAP plotting modification...")
+        # plot_umaps(model_dir=args["artifact_path"], all_drugs=False, parallel=True)
         # plot_progression(model_dir=args["artifact_path"], rep="ZXs", feature="cell_name", freq=100)
         # plot_progression(model_dir=args["artifact_path"], rep="ZTs", feature="dose", freq=100)
 

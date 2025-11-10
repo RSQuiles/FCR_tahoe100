@@ -3,6 +3,8 @@ import scipy
 import numpy as np
 import scanpy as sc
 import pandas as pd
+from pathlib import Path
+import time
 
 import torch
 
@@ -37,10 +39,15 @@ class Dataset:
         args = None,
         drug_metadata_path = "/cluster/work/bewi/data/tahoe100/metadata/drug_metadata.parquet",
     ):
+        
+        # Measure time to load dataset
+        start = time.time()
+
         if type(data) == str:
-            # MODIFIED: Only load metadata (light) and read expression data on demand during training 
+            # MODIFIED: Only load metadata (light) and read expression data on demand during training
+            data_path = Path(data) 
             print("Reading AnnData...")
-            self.adata = sc.read(data, backed="r")
+            self.adata = sc.read(data_path, backed="r")
 
         self.sample_cf = sample_cf
         self.cf_samples = cf_samples
@@ -130,6 +137,11 @@ class Dataset:
         #    self.genes = torch.Tensor(data.X.A)
         #else:
         #    self.genes = torch.Tensor(data.X) # data.layers["counts"]
+
+        # Modified: read from precomputed .npy file
+        genes_path = data_path.with_name("genes.npy")
+        self.genes = np.load(genes_path, mmap_mode='r')
+        print("Finished loading genes.npy file...")
 
         self.var_names = self.adata.var_names
 
@@ -248,6 +260,9 @@ class Dataset:
         self.de_genes = self.adata.uns["rank_genes_groups_cov"]
         """
 
+        # Time to load dataset
+        print(f"Dataset load has elapsed: {start - time.time():.2f} seconds.")
+
     def get_unique_perts(self, all_perts=None):
         if all_perts is None:
             all_perts = self.pert_names
@@ -287,7 +302,7 @@ class SubDataset_Pair:
             self.perts_dict = dataset.perts_dict
         self.covars_dict = dataset.covars_dict
 
-        # self.genes = dataset.genes[indices]
+        self.genes = dataset.genes[indices]
         self.perturbations = indx(dataset.perturbations, indices)
         self.controls = dataset.controls[indices]
         self.covariates = [indx(cov, indices) for cov in dataset.covariates]
@@ -339,23 +354,26 @@ class SubDataset_Pair:
         if cf_name in self.cov_control:
             cf_inds = self.cov_control_idx[cf_name]
             cf_i = np.random.choice(cf_inds)
-            parent_cf_i = self.indices[cf_i]
-            cf_genes = self.dataset.adata.X[parent_cf_i,:]
-            if scipy.sparse.issparse(cf_genes):
-                cf_genes = cf_genes.toarray().squeeze()
-            cf_genes = torch.from_numpy(cf_genes)
+            #parent_cf_i = self.indices[cf_i]
+            #cf_genes = self.dataset.adata.X[parent_cf_i,:]
+            #if scipy.sparse.issparse(cf_genes):
+            #    cf_genes = cf_genes.toarray().squeeze()
+            #cf_genes = torch.from_numpy(cf_genes)
+            cf_genes = torch.from_numpy(self.genes[cf_i]).float()
         
         ### get gene activations
         parent_idx = self.indices[i]
-        genes = self.dataset.adata.X[parent_idx,:]
-        if scipy.sparse.issparse(genes):
-            genes = genes.toarray().squeeze()
-        genes = torch.from_numpy(genes)
+        #genes = self.dataset.adata.X[parent_idx,:]
+        #if scipy.sparse.issparse(genes):
+        #    genes = genes.toarray().squeeze()
+        #genes = torch.from_numpy(genes)
+        genes = torch.from_numpy(self.genes[i]).float()
                         
         return (
             genes,
             indx(self.perturbations, i),
             cf_genes,
+            parent_idx, # ADDED: AnnData row indexes corresponding to each sample
             cf_i,
             *[indx(cov, i) for cov in self.covariates]
         )
@@ -395,7 +413,7 @@ class SubDataset:
             genes = genes.toarray().squeeze()
 
         genes = torch.from_numpy(genes)
-        self.genes = genes
+        self.genes = dataset.genes[indices]
 
         self.perturbations = indx(dataset.perturbations, indices)
         self.controls = dataset.controls[indices]
@@ -435,7 +453,7 @@ class SubDataset:
             cf_i = np.random.choice(len(self.pert_dose))
             cf_pert_dose_name = self.pert_dose[cf_i]
 
-        cf_genes = None
+        #cf_genes = None
         if self.sample_cf:
             covariate_name = indx(self.cov_names, i)
             cf_name = covariate_name + f"_{cf_pert_dose_name}"
@@ -443,16 +461,16 @@ class SubDataset:
             if cf_name in self.cov_pert_dose_idx:
                 cf_inds = self.cov_pert_dose_idx[cf_name]
                 cf_i = np.random.choice(cf_inds, min(len(cf_inds), self.cf_samples))
-                parent_cf_i = self.indices[cf_i]
-                cf_genes = self.parent_dataset.dataset.adata.X[parent_cf_i,:]
-                if scipy.sparse.issparse(cf_genes):
-                    cf_genes = cf_genes.toarray().squeeze()
-                cf_genes = torch.from_numpy(cf_genes)
+                #parent_cf_i = self.indices[cf_i]
+                #cf_genes = self.parent_dataset.dataset.adata.X[parent_cf_i,:]
+                #if scipy.sparse.issparse(cf_genes):
+                #    cf_genes = cf_genes.toarray().squeeze()
+                #cf_genes = torch.from_numpy(cf_genes)
 
         return (
             self.genes[i],
             indx(self.perturbations, i),
-            cf_genes,
+            self.genes[cf_i],
             indx(self.perturbations, cf_i),
             *[indx(cov, i) for cov in self.covariates]
         )
@@ -511,6 +529,7 @@ def load_dataset_train_test(
         perturbation_input=perturbation_input, args=args
     )
 
+    start_split = time.time()
     splits = {
         "train": dataset.subset("train", "all"),
         "test": dataset.subset("test", "all"),
@@ -518,6 +537,7 @@ def load_dataset_train_test(
         ## modified: returns whole dataset for testing and visualization
         "all": dataset.subset("all","all")
     }
+    print(f"Dataset split has elapsed: {time.time() - start_split} seconds.")
 
     if return_dataset:
         return splits, dataset

@@ -127,6 +127,7 @@ class FCR(nn.Module):
         # hyperparameter sweep
         self.sweep = sweep
         # set hyperparameters
+        self.batch_size = batch_size
         self._set_hparams_(hparams)
 
         ## modified: adapt for non-sampling case
@@ -1289,7 +1290,7 @@ class FCR(nn.Module):
 
             #print("Conditions tensor: ", conditions)
             # NEW: separate conditions into treatment and covariate conditions for discriminator
-            cov_conditions = covariates = torch.cat(covariates, dim=1)
+            cov_conditions = torch.cat(covariates, dim=1)
             #print("Covariate conditions: ", cov_conditions)
             #print("Treatment conditions:", treatments)
 

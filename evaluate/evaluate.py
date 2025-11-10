@@ -208,7 +208,7 @@ def evaluate_r2_classic(model, dataset, dataset_control, batch_size=None, min_sa
     ]
 
 # ADDED: eval flag enables the usage of the "eval" model, so that the original model is not used (crucial for DDP implementation)
-def evaluate_prediction(model, datasets, batch_size=None, eval=False):
+def evaluate_prediction(model, datasets, eval=False):
     """
     `evaluate` used in CPA
     https://github.com/facebookresearch/CPA
@@ -220,20 +220,18 @@ def evaluate_prediction(model, datasets, batch_size=None, eval=False):
             "train": evaluate_prediction_r2(
                 model,
                 datasets["train"].subset_condition(control=False),
-                batch_size=batch_size,
                 eval=eval
             ),
             "test": evaluate_prediction_r2(
                 model,
                 datasets["test"].subset_condition(control=False),
-                batch_size=batch_size,
                 eval=eval
             )
         }
     return evaluation_stats
 
-
-def evaluate_prediction_r2(model, dataset, batch_size=None, min_samples=30, eval=False):
+## Modified: eliminated batch_size argument
+def evaluate_prediction_r2(model, dataset, min_samples=30, eval=False):
     """
     `evaluate_r2` used in CPA
     https://github.com/facebookresearch/CPA
@@ -242,9 +240,6 @@ def evaluate_prediction_r2(model, dataset, batch_size=None, min_samples=30, eval
     mean_score, mean_score_de = [], []
     genes = dataset.genes
     perts = dataset.perturbations
-    num = genes.size(0)
-    if batch_size is None:
-        batch_size = num
 
     for pert_category in np.unique(dataset.cov_pert):
         # pert_category category contains: 'cov_pert' info
@@ -257,7 +252,7 @@ def evaluate_prediction_r2(model, dataset, batch_size=None, min_samples=30, eval
         if len(idx) > min_samples:
             perts = dataset.perturbations[idx]
             covars = [covar[idx] for covar in dataset.covariates]
-            genes = dataset.genes[idx, :]
+            genes = torch.from_numpy(dataset.genes[idx, :]).float()
             num_eval = 0
             yp = [] 
             out = model.predict_self(
@@ -270,7 +265,7 @@ def evaluate_prediction_r2(model, dataset, batch_size=None, min_samples=30, eval
             yp = out.detach().cpu()
             yp_m = yp.mean(0)
             
-            yt = dataset.genes[idx, :].numpy()
+            yt = dataset.genes[idx, :]
             yt_m = yt.mean(axis=0)
 
             mean_score.append(r2_score(yt_m, yp_m))

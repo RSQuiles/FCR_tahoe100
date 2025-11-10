@@ -111,14 +111,14 @@ def prepare(args, state_dict=None, split_name="train"):
     args = args,
     )
     
-       
+    shuffle = True if split_name=="train" else False
 
     datasets.update(
         {
             "loader_tr": torch.utils.data.DataLoader(
                 datasets[split_name],
                 batch_size=args["batch_size"],
-                shuffle=False,
+                shuffle=True,
                 collate_fn=(lambda batch: data_collate(batch, nb_dims=1))
             )
         }
@@ -180,12 +180,15 @@ def train(args, prepare=prepare, state_dict=None):
                     adv_training=False
                 # print("Adversarial Training {}".format(adv_training))
 
+                # Determine epoch time
+                epoch_start_time = time.time()
+
                 minibatch_counter = 0
                 for data in datasets["loader_tr"]:
 
                     # print("Training with minibatch ", minibatch_counter)
-                    (experiment, treatment, control, _, covariates)= \
-                    (data[0], data[1], data[2], data[3], data[4:])
+                    (experiment, treatment, control, _, _, covariates)= \
+                    (data[0], data[1], data[2], data[3], data[4], data[5:])
 
                     # Check dimensions of inputs
                     # print("Experiment dimensions: ", experiment.shape)
@@ -198,6 +201,11 @@ def train(args, prepare=prepare, state_dict=None):
                     )
                     
                     minibatch_counter += 1
+
+                    # Logging minibatches
+                    if (minibatch_counter % 10) == 0:
+                        print(f"Epoch {epoch} - Minibatch {minibatch_counter}")
+                        print(f"Minibatch rate: {(time.time() - epoch_start_time)/minibatch_counter} sec")
                     
                     ## Legacy code for training with divergence 
                     # minibatch_training_stats = model.update_divergence(

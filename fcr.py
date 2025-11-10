@@ -60,6 +60,7 @@ def fetch_latest(directory, suffix=".pt", target_epoch=None):
 def get_model(model_dir, target_epoch=None, dataset="all"):
     # Get path to model checkpoint
     model_path = fetch_latest(model_dir, target_epoch=target_epoch)
+    print(f"Model path: {model_path}")
 
     # LOAD ARGUMENTS
     # Note: dataset_mode defines which dataset split will be in the loader
@@ -112,19 +113,26 @@ class FCR_sim:
         
         return arguments
 
-    def load_model(self, model_path, dataset="train"):
-        from .train import prepare
+    def load_model(self, model_path, dataset):
 
         if not os.path.isfile(model_path):
             raise FileNotFoundError("The model_path specified does not exist")
         else:
             state_dict = torch.load(model_path)
             self.arguments = state_dict[1]
-            # Correct for arguments added in the future
+            # For retrocompatibility
             if "sweep" not in self.arguments.keys():
                 self.arguments["sweep"] = False
-                
-            self.model, self.dataset = prepare(self.arguments, state_dict[0], dataset)
+            if "separate_outcomes_emb" not in self.arguments.keys():
+                self.arguments["separate_outcomes_emb"] = True
+
+            # Different prepare function depending on pararllel flag
+            if self.arguments.get("parallel", False):
+                from .train.train_parallel import prepare
+                self.model, self.dataset = prepare(self.arguments, world_size=1, rank=0, local_rank=0, state_dict=state_dict[0])
+            else:
+                from .train.train import prepare
+                self.model, self.dataset = prepare(self.arguments, state_dict[0], dataset)
     
     def train_fcr(self, state_dict=None, parallel=False):
         """

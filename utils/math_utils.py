@@ -87,7 +87,7 @@ def kldiv_normal_marginal(mu1: torch.Tensor, sigma1: torch.Tensor,
     ## modified: check KL result
     if torch.isnan(result).any:
         print("INPUTS: mu1, sigma1, mu2, sigma2 --> ", mu1, sigma1, mu2, sigma2)
-        raise RuntimeErroe("Computed NaN KL Divergence")
+        raise RuntimeError("Computed NaN KL Divergence")
     return result
 
 def aggregate_normal_distr(mus: list, sigmas: list):
