@@ -143,10 +143,10 @@ class Dataset:
         
         # GENES
         # Modified: read gene expression from precomputed .npy file
-        genes_path = data_path.with_name("genes.npy")
-        self.genes = np.load(genes_path, mmap_mode='r')
+        # genes_path = data_path.with_name("genes.npy")
+        # self.genes = np.load(genes_path, mmap_mode='r')
         # self.genes = np.load(genes_path) # load into memory
-        print("Finished loading genes.npy file...")
+        # print("Finished loading genes.npy file...")
 
         # PERTURBATIONS
         # get unique perturbations
@@ -253,13 +253,16 @@ class Dataset:
 
 class SubDataset_Pair:
     """
-    Memory-efficient subset of Dataset.
-    It does NOT copy any data — it only stores index references.
+    Access-efficient subset of Dataset.
+    It can update the loaded shard of gene expression data to reduce memory usage
+    and access more efficiently from RAM.
     """
 
     def __init__(self, dataset, indices):
         self.dataset = dataset  # Keep reference to parent
-        self.indices = np.array(indices, dtype=np.int64)  # store as numpy array
+        self.indices = np.array(indices, dtype=np.int64)  # Store which indices this subset uses
+        self.shard_size = None
+
         self.sample_cf = dataset.sample_cf
         self.cf_samples = dataset.cf_samples
 
@@ -275,79 +278,115 @@ class SubDataset_Pair:
             self.perts_dict = dataset.perts_dict
         self.covars_dict = dataset.covars_dict
 
-        # Keep references to parent dataset
-        self.genes = dataset.genes
-        self.perturbations = dataset.perturbations
-        self.controls = dataset.controls
-        self.covariates = dataset.covariates
-        self.pert_names = dataset.pert_names
-        self.doses = dataset.doses
-        self.cov_names = dataset.cov_names
-        self.cov_pert = dataset.cov_pert
-        self.pert_dose = dataset.pert_dose
-        self.cov_pert_dose = dataset.cov_pert_dose
-        self.cov_control = dataset.cov_control
+        # self.genes = dataset.genes[indices]
+        self.perturbations = indx(dataset.perturbations, indices)
+        self.controls = dataset.controls[indices]
+        self.covariates = [indx(cov, indices) for cov in dataset.covariates]
+
+        self.pert_names = indx(dataset.pert_names, indices)
+        self.doses = indx(dataset.doses, indices)
+
+        self.cov_names = indx(dataset.cov_names, indices)
+        self.cov_pert = indx(dataset.cov_pert, indices)
+        self.pert_dose = indx(dataset.pert_dose, indices)
+        self.cov_pert_dose = indx(dataset.cov_pert_dose, indices)
+        self.cov_control = indx(dataset.cov_control, indices)
         self.control_vals = '1'
+
+        # Added: store cf_genes for each covariate
+        self.backup_cf = {}
+        
         self.var_names = dataset.var_names
+        self.total_len = dataset.n_obs # Full length of original dataset
+        # self.n_obs = len(indices)
+
         self.num_covariates = dataset.num_covariates
         self.num_outcomes = dataset.num_outcomes
         self.num_treatments = dataset.num_treatments
 
         if self.sample_cf:
+            self.cov_pert_dose_idx = unique_ind(self.cov_pert_dose)
             self.cov_control_idx = unique_ind(self.cov_control)
 
-        self.n_obs = len(self.indices)
 
-    # Standard PyTorch Dataset interface
-    def __len__(self):
-        return self.n_obs
-
-    def __getitem__(self, i):
-
-        # Genes loaded on demand from disk
-
-        # Lookup real index in parent dataset
-        parent_idx = self.indices[i]
-
-        # Fetch treated genes
-        genes = torch.as_tensor(self.genes[parent_idx])
-
-        cf_genes = None
-        cf_i = 0
-
-        # Genes loaded in RAM
-        if self.sample_cf:
-            cov_name = self.cov_names[parent_idx]
-            cf_name = f"{cov_name}_{self.control_vals}"
-            if cf_name in self.cov_control_idx:
-                cf_candidates = self.cov_control_idx[cf_name]
-                cf_i = np.random.choice(cf_candidates)
-                cf_genes = torch.as_tensor(self.genes[cf_i])
-
-        if self.sample_cf:
-            cov_name = self.cov_names[parent_idx]
-            cf_name = f"{cov_name}_{self.control_vals}"
-            if cf_name in self.cov_control_idx:
-                cf_candidates = self.cov_control_idx[cf_name]
-                cf_i = np.random.choice(cf_candidates)
-                cf_genes = torch.as_tensor(self.genes[cf_i])
-
-        return (
-            genes,
-            self.perturbations[parent_idx],
-            cf_genes,
-            parent_idx,
-            cf_i,
-            *[cov[parent_idx] for cov in self.covariates]
-        )
-
-    # Subset to return SubDataset
     def subset_condition(self, control=True):
         if control is None:
             return self
         else:
             idx = np.where(self.controls == control)[0].tolist()
             return SubDataset(self, idx)
+        
+    def update_shard(self, shard_path, shard_id):
+        """
+        Update loaded gene expression data from a given shard file.
+        Need a consistent mapping between:
+            - Global indices
+            - Shard local indices
+        """
+        print(f"Loading shard {shard_id} from {shard_path}...")
+        all_genes = np.load(shard_path, mmap_mode='r')
+        if self.shard_size is None:
+            self.shard_size = all_genes.shape[0]
+
+        self.shard_start = shard_id * self.shard_size
+        self.shard_end = (shard_id + 1) * self.shard_size if (shard_id + 1) * self.shard_size < self.total_len else self.total_len
+
+        # Mask indices belonging to this shard
+        mask = (self.shard_start <= self.indices) & (self.indices < self.shard_end)
+
+        # Only retain the relevant subset
+        self.active_indices = self.indices[mask] - self.shard_start
+        self.n_obs = len(self.active_indices)
+        self.genes = all_genes
+
+    def __getitem__(self, i):
+
+        ### get gene activations
+        global_idx = self.active_indices[i]
+        genes = torch.from_numpy(self.genes[global_idx]).float()
+        
+        ### get the control sample
+    
+        cf_pert_dose_name = self.control_names[0]
+        cf_genes = None
+        cf_i=0
+        covariate_name = indx(self.cov_names, i)
+        cf_name = covariate_name + f"_{self.control_vals}"
+
+        # Get counterfactual genes (from control)
+        if cf_name in self.cov_control:
+            cf_inds = self.cov_control_idx[cf_name]
+            # keep only cf indices that fall within this shard
+            cf_inds = [j for j in cf_inds if self.shard_start <= j < self.shard_end]
+            if len(cf_inds) > 0:
+                cf_i_global = np.random.choice(cf_inds)
+                cf_i_local = cf_i_global - self.shard_start
+                cf_genes = torch.from_numpy(self.genes[cf_i_local]).float()
+                # Add backup for future shards
+                if cf_name not in self.backup_cf:
+                    self.backup_cf[cf_name] = cf_genes
+
+            elif cf_name in self.backup_cf:
+                cf_genes = self.backup_cf[cf_name]
+
+            else:
+                cf_genes = None
+                cf_i = None  # No available cf in this shard, skip sample
+
+        ### get parent idx
+        parent_idx = self.indices[i]  # ADDED: AnnData row indexes corresponding to each sample
+                        
+        return (
+            genes,
+            indx(self.perturbations, i),
+            cf_genes,
+            parent_idx, # ADDED: AnnData row indexes corresponding to each sample
+            cf_i,
+            *[indx(cov, i) for cov in self.covariates]
+        )
+
+    def __len__(self):
+        return self.n_obs
 
 class SubDataset:
     """

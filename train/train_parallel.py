@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import StepLR
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from socket import gethostname
+from pathlib import Path
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -34,14 +35,8 @@ torch.autograd.set_detect_anomaly(True)
 def prepare(args, world_size, rank, local_rank, state_dict=None, split_name="train"):
     """
     Instantiates model and dataset to run an experiment.
+    Gene shards will be updated later in the training loop.
     """
-
-#     perturbation_key = "perturbation",
-#     control_key = "control",
-#         dose_key = "dose",
-#         covariate_keys = "cell_type",
-#         split_key = "split"
-    
     
     # dataset
     if args['covariate_keys']!= None:
@@ -61,12 +56,6 @@ def prepare(args, world_size, rank, local_rank, state_dict=None, split_name="tra
     control_name = args.get("control_name", None)
     embedded_dose = args.get("embedded_dose", None)
 
-    # if args['split']=="split":
-    #     datasets = load_dataset_splits(
-    #         args["data_path"],
-    #         sample_cf=(True if args["dist_mode"] == "match" else False),
-    #     )
-    # elif args['split']=="new_split":
     datasets = load_dataset_train_test(
     args["data_path"],
     perturbation_input = args.get("perturbation_input", "ohe"),
@@ -77,29 +66,6 @@ def prepare(args, world_size, rank, local_rank, state_dict=None, split_name="tra
     control_name = control_name,
     embedded_dose = embedded_dose,
     args = args,
-    )
-
-    # Train Sampler ensures no overlapping samples between processes
-    train_sampler = torch.utils.data.distributed.DistributedSampler(datasets[split_name],
-                                                                    num_replicas=world_size,
-                                                                    rank=rank,
-                                                                    shuffle=False
-                                                                    )
-    
-    print(f"Number of workers: ", {os.environ["SLURM_CPUS_PER_TASK"]})
-    datasets.update(
-        {
-            "loader_tr": torch.utils.data.DataLoader(
-                datasets[split_name],
-                batch_size=args["batch_size"],
-                sampler=train_sampler,
-                num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]),
-                prefetch_factor=4,
-                pin_memory = True,
-                persistent_workers=True,
-                collate_fn=(lambda batch: data_collate(batch, nb_dims=1))
-            )
-        }
     )
 
     args["num_outcomes"] = datasets["train"].num_outcomes
@@ -178,19 +144,11 @@ def train(args, prepare=prepare, state_dict=None):
     # Only the Rank 0 process will log
     log_proc = (rank == 0)
 
-    train_ddp(ddp_model, args, datasets, log_proc, 
-              optimizer_autoencoder, optimizer_discriminator,
-              scheduler_autoencoder, scheduler_discriminator)
-
-    return
-
-
-def train_ddp(model, args, datasets, log_proc, 
-              optimizer_autoencoder, optimizer_discriminator,
-              scheduler_autoencoder, scheduler_discriminator):
     """
-    Trains a FCR model with DDP
+    Train the FCR model with DDP
     """
+    model = ddp_model
+
     # Setup logging (only rank 0 process log)
     if log_proc:
         wandb.init(config=args, project=args["name"], name=args["experiment"])
@@ -214,72 +172,115 @@ def train_ddp(model, args, datasets, log_proc,
     # if log_proc:
     #     print("DDP static graph set")
 
+    # Determine number of shards
+    shard_path = Path(args["data_path"]).parent
+    shard_count = len(list(shard_path.glob("genes_part*")))
+
     for epoch in range(args["max_epochs"]):
-        # Activate training mode
-        model.train()
 
-        # Determine epoch time
-        epoch_start_time = time.time()
+        # Go over gene expression shards
+        for shard_id in range(shard_count):
 
-        # Set epoch for DistributedSampler to reshuffle differently each epoch
-        datasets["loader_tr"].sampler.set_epoch(epoch)
-        
-        epoch_training_stats = defaultdict(float)
-        if (epoch % args["adv_epoch"]) == 0:
-            adv_training=True
-        else:
-            adv_training=False
-        # print("Adversarial Training {}".format(adv_training))
+            # Activate training mode
+            model.train()
 
-        minibatch_counter = 0
-        for data in datasets["loader_tr"]:
+            # Determine epoch time
+            epoch_start_time = time.time()
 
-            # print("Training with minibatch ", minibatch_counter)
-            (experiment, treatment, control, _, _, covariates)= \
-            (data[0], data[1], data[2], data[3], data[4], data[5:])
+            # Update gene expression shard for this epoch
+            shard_file = shard_path / f"genes_part{shard_id}.npy"
+            datasets["train"].update_shard(str(shard_file), shard_id)
 
-            # Freeze the discriminator if adv_training
-            if not adv_training:
-                model.module.freeze_discriminator(True)
-
-            # Forward pass through DDP wrapper
-            loss, minibatch_training_stats = \
-            model(
-                experiment, 
-                treatment, 
-                control, 
-                covariates, 
-                adv_training=adv_training, 
-                sample_latent=args["hparams"]["sample_latent"]
-            )
+            # Set Distributed DataLoader
+            # Train Sampler ensures no overlapping samples between processes
+            train_sampler = torch.utils.data.distributed.DistributedSampler(datasets["train"],
+                                                                            num_replicas=world_size,
+                                                                            rank=rank,
+                                                                            shuffle=False
+                                                                            )
             
-            # Backward pass and optimization step
-            optimizer_autoencoder.zero_grad()
-            optimizer_discriminator.zero_grad()
+            loader =  torch.utils.data.DataLoader(
+                        datasets["train"],
+                        batch_size=args["batch_size"],
+                        sampler=train_sampler,
+                        num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]),
+                        prefetch_factor=4,
+                        pin_memory = True,
+                        persistent_workers=True,
+                        collate_fn=(lambda batch: data_collate(batch, nb_dims=1))
+                    )
+
+            # TRAIN FOR ONE EPOCH:
+            # Set epoch for DistributedSampler to reshuffle differently each epoch
+            loader.sampler.set_epoch(epoch)
             
-            # Single backward pass
-            loss.backward()
-            
-            # Step only the relevant optimizer based on training phase
-            if not adv_training:
-                optimizer_autoencoder.step()
+            epoch_training_stats = defaultdict(float)
+            # if (epoch % args["adv_epoch"]) == 0:
+            if (shard_id % args["adv_epoch"]) == 0:
+                adv_training=True
             else:
-                optimizer_discriminator.step()
+                adv_training=False
+            # print("Adversarial Training {}".format(adv_training))
 
-            # Unfreeze discriminator after iteration
-            if not adv_training:
-                model.module.freeze_discriminator(True)
+            minibatch_counter = 0
+            for data in loader:
 
-            minibatch_counter += 1
+                # print("Training with minibatch ", minibatch_counter)
+                (experiment, treatment, control, _, cf_i, covariates)= \
+                (data[0], data[1], data[2], data[3], data[4], data[5:])
 
-            # Logging minibatches
-            if (minibatch_counter % 10) == 0 and log_proc:
-                print(f"Epoch {epoch} - Minibatch {minibatch_counter}")
-                print(f"Minibatch rate: {(time.time() - epoch_start_time)/minibatch_counter} sec")
+                if cf_i is None:
+                    # Skip samples without counterfactual in this shard
+                    continue
 
-            for key, val in minibatch_training_stats.items():
-                epoch_training_stats[key] += val
+                # Freeze the discriminator if adv_training
+                if not adv_training:
+                    model.module.freeze_discriminator(True)
 
+                # Forward pass through DDP wrapper
+                loss, minibatch_training_stats = \
+                model(
+                    experiment, 
+                    treatment, 
+                    control, 
+                    covariates, 
+                    adv_training=adv_training, 
+                    sample_latent=args["hparams"]["sample_latent"]
+                )
+                
+                # Backward pass and optimization step
+                optimizer_autoencoder.zero_grad()
+                optimizer_discriminator.zero_grad()
+                
+                # Single backward pass
+                loss.backward()
+                
+                # Step only the relevant optimizer based on training phase
+                if not adv_training:
+                    optimizer_autoencoder.step()
+                else:
+                    optimizer_discriminator.step()
+
+                # Unfreeze discriminator after iteration
+                if not adv_training:
+                    model.module.freeze_discriminator(True)
+
+                minibatch_counter += 1
+
+                # Logging minibatches
+                if (minibatch_counter % 5) == 0 and log_proc:
+                    # print(f"Epoch {epoch} - Minibatch {minibatch_counter}")
+                    print(f"Epoch {shard_id} - Minibatch {minibatch_counter}")
+                    print(f"Minibatch rate: {(time.time() - epoch_start_time)/minibatch_counter} sec")
+
+                for key, val in minibatch_training_stats.items():
+                    epoch_training_stats[key] += val
+
+            # Clean cache
+            del loader, train_sampler
+            torch.cuda.empty_cache()
+
+        """
         # Average epoch stats over number of minibatches
         for key, val in epoch_training_stats.items():
             epoch_training_stats[key] = val / len(datasets["loader_tr"])
@@ -368,6 +369,7 @@ def train_ddp(model, args, datasets, log_proc,
         # plot_progression(model_dir=args["artifact_path"], rep="ZTs", feature="dose", freq=100)
 
         writer.close()
+        """
 
     return 
 
