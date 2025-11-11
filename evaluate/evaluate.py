@@ -250,6 +250,7 @@ def evaluate_prediction_r2(model, dataset, min_samples=30, eval=False):
 
         # estimate metrics only for reasonably-sized perturbation/cell-type combos
         if len(idx) > min_samples:
+            print("The evaluation is happening!")
             perts = dataset.perturbations[idx]
             covars = [covar[idx] for covar in dataset.covariates]
             genes = torch.from_numpy(dataset.genes[idx, :]).float()

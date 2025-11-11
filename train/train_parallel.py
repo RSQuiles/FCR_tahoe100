@@ -94,7 +94,7 @@ def prepare(args, world_size, rank, local_rank, state_dict=None, split_name="tra
                 batch_size=args["batch_size"],
                 sampler=train_sampler,
                 num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]),
-                prefetch_factor=2,
+                prefetch_factor=4,
                 pin_memory = True,
                 persistent_workers=True,
                 collate_fn=(lambda batch: data_collate(batch, nb_dims=1))

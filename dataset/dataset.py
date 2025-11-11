@@ -48,106 +48,107 @@ class Dataset:
             data_path = Path(data) 
             print("Reading AnnData...")
             self.adata = sc.read(data_path, backed="r")
+            # Cache references
+            self.obs = self.adata.obs
 
         self.sample_cf = sample_cf
         self.cf_samples = cf_samples
 
-        # MODIFIED: INCREASE FLEXIBILITY AND ADAPT TO TAHOE100 Dataset
+        # MODIFIED: INCREASE FLEXIBILITY AND ADAPT TO HUGE DATASETS (millions of samples)
+
         # Fields
         # perturbation
-        #if perturbation_key in data.uns["fields"]:
-        #    perturbation_key = data.uns["fields"][perturbation_key]
-        #else:
-        assert perturbation_key in self.adata.obs.columns, f"Perturbation {perturbation_key} is missing in the provided adata"
+        assert perturbation_key in self.obs.columns, f"Perturbation {perturbation_key} is missing in the provided adata"
 
         # control
-        #if control_key in data.uns["fields"]:
-        #    control_key = data.uns["fields"][control_key]
-        #else:
-        if control_key not in self.adata.obs.columns:
+        if control_key not in self.obs.columns:
             if control_name is not None:
                 print(f"Adding control column based on control name: {control_name}...")
-                self.adata.obs[control_key] = (self.adata.obs[perturbation_key] == control_name).astype(int)
+                self.obs[control_key] = (self.obs[perturbation_key] == control_name).astype(int)
             else:
                 raise ValueError(f"Control {control_key} is missing in the provided adata and no control_name was given.")
         
         # dose
-        #if dose_key in data.uns["fields"]:
-        #    dose_key = data.uns["fields"][dose_key]
         if dose_key is None:
             print("Adding a dummy dose...")
-            self.adata.obs["dummy_dose"] = 1.0
+            self.obs["dummy_dose"] = 1.0
             dose_key = "dummy_dose"
-        elif dose_key not in self.adata.obs.columns:
+        elif dose_key not in self.obs.columns:
             if embedded_dose is not None:
-                self.adata.obs[dose_key] = self.adata.obs[embedded_dose].str.split(",").str[1].astype(float)
+                self.obs[dose_key] = self.obs[embedded_dose].str.split(",").str[1].astype(float)
             else:
                 raise ValueError(f"Dose {dose_key} is missing in the provided adata and no embedded_dose column was given.")
 
         # covariates
-        #if isinstance(covariate_keys, str) and covariate_keys in data.uns["fields"]:
-        #    covariate_keys = list(data.uns["fields"][covariate_keys])
         if covariate_keys is None or len(covariate_keys)==0:
             print("Adding a dummy covariate...")
-            self.adata.obs["dummy_covar"] = "dummy-covar"
+            self.obs["dummy_covar"] = "dummy-covar"
             covariate_keys = ["dummy_covar"]
         else:
             if not isinstance(covariate_keys, list):
                 covariate_keys = [covariate_keys]
             for key in covariate_keys:
-                assert key in self.adata.obs.columns, f"Covariate {key} is missing in the provided adata"
+                assert key in self.obs.columns, f"Covariate {key} is missing in the provided adata"
+
         # split
-        #if split_key in data.uns["fields"]:
-        #    split_key = data.uns["fields"][split_key]
-        if split_key is None or split_key not in self.adata.obs.columns:
+        if split_key is None or split_key not in self.obs.columns:
             print(f"Performing automatic train-test split with {test_ratio} ratio.")
             from sklearn.model_selection import train_test_split
 
-            self.adata.obs["split"] = "train"
+            self.obs["split"] = "train"
             idx_train, idx_test = train_test_split(
                 self.adata.obs_names, test_size=test_ratio, random_state=random_state
             )
-            self.adata.obs["split"].loc[idx_train] = "train"
-            self.adata.obs["split"].loc[idx_test] = "test"
+            self.obs["split"].loc[idx_train] = "train"
+            self.obs["split"].loc[idx_test] = "test"
             split_key = "split"
         else:
-            assert split_key in self.adata.obs.columns, f"Split {split_key} is missing in the provided adata"
+            assert split_key in self.obs.columns, f"Split {split_key} is missing in the provided adata"
 
-        self.indices = {
-            "all": list(range(len(self.adata.obs))),
-            "control": np.where(self.adata.obs[control_key] == 1)[0].tolist(),
-            "treated": np.where(self.adata.obs[control_key] != 1)[0].tolist(),
-            "train": np.where(self.adata.obs[split_key] == "train")[0].tolist(),
-            "test": np.where(self.adata.obs[split_key] == "test")[0].tolist(),
-            "ood": np.where(self.adata.obs[split_key] == "ood")[0].tolist(),
-        }
-
+        # Store keys
         self.perturbation_key = perturbation_key
         self.perturbation_input = perturbation_input
         self.control_key = control_key
         self.dose_key = dose_key
         self.covariate_keys = covariate_keys
+        self.split_key = split_key
 
+        # Vectorized categorical conversion for metadata
+        keys = [perturbation_key, dose_key, control_key, split_key]
+        keys.extend(covariate_keys if covariate_keys is not None else [])
+        for key in keys:
+            if key in self.obs.columns:
+                self.obs[key] = self.obs[key].astype("category")
+
+        # Precompute useful columns as NumPy arrays
+        self.pert_names = self.obs[perturbation_key].astype(str).values
+        self.doses = self.obs[dose_key].astype(str).values
+        self.controls = self.obs[control_key].astype(str).values
         self.control_names = np.unique(
-            self.adata[self.adata.obs[self.control_key] == 1].obs[self.perturbation_key]
+            self.adata[self.obs[self.control_key] == 1].obs[self.perturbation_key]
         )
-        
-        # Modified: load gene expression on demand during training
-        #if scipy.sparse.issparse(data.X):
-        #    self.genes = torch.Tensor(data.X.A)
-        #else:
-        #    self.genes = torch.Tensor(data.X) # data.layers["counts"]
-
-        # Modified: read from precomputed .npy file
-        genes_path = data_path.with_name("genes.npy")
-        self.genes = np.load(genes_path, mmap_mode='r')
-        print("Finished loading genes.npy file...")
 
         self.var_names = self.adata.var_names
 
-        self.pert_names = np.array(self.adata.obs[perturbation_key].values)
-        self.doses = np.array(self.adata.obs[dose_key].values)
+        n = len(self.obs)
 
+        self.indices = {
+            "all": np.arange(n),
+            "control": np.where(self.obs[control_key].cat.codes == 1)[0],
+            "treated": np.where(self.obs[control_key].cat.codes != 1)[0],
+            "train": np.where(self.obs[split_key] == "train")[0],
+            "test": np.where(self.obs[split_key] == "test")[0],
+            "ood": np.where(self.obs[split_key] == "ood")[0],
+        }
+        
+        # GENES
+        # Modified: read gene expression from precomputed .npy file
+        genes_path = data_path.with_name("genes.npy")
+        self.genes = np.load(genes_path, mmap_mode='r')
+        # self.genes = np.load(genes_path) # load into memory
+        print("Finished loading genes.npy file...")
+
+        # PERTURBATIONS
         # get unique perturbations
         pert_unique = np.array(self.get_unique_perts())
 
@@ -192,8 +193,8 @@ class Dataset:
         else:
             raise NotImplementedError("Unmatched input mode for treatments")
 
-        self.controls = self.adata.obs[self.control_key].values.astype(bool)
 
+        # COVARIATES
         if covariate_keys is not None:
             if not len(covariate_keys) == len(set(covariate_keys)):
                 raise ValueError(f"Duplicate keys were given in: {covariate_keys}")
@@ -202,7 +203,7 @@ class Dataset:
             self.covariates = []
             self.num_covariates = []
             for cov in covariate_keys:
-                values = np.array(self.adata.obs[cov].values)
+                values = self.obs[cov].astype(str).values
                 cov_names.append(values)
 
                 names = np.unique(values)
@@ -216,9 +217,10 @@ class Dataset:
                 self.covariates.append(
                     torch.stack([self.covars_dict[cov][v] for v in values])
                 )
-            self.cov_names = np.array(["_".join(c) for c in zip(*cov_names)])
+            # self.cov_names = np.array(["_".join(c) for c in zip(*cov_names)], dtype=str)
+            self.cov_names = pd.Series(["_".join(c) for c in zip(*cov_names)]).astype(str).values
         else:
-            self.cov_names = np.array([""] * len(data))
+            self.cov_names = np.array([""] * len(data), dtype=str)
             self.covars_dict = None
             self.covariates = None
             self.num_covariates = None
@@ -226,39 +228,10 @@ class Dataset:
         self.num_outcomes = self.adata.n_vars
         self.n_obs = self.adata.n_obs
 
-        self.cov_pert = np.array([
-            f"{self.cov_names[i]}_"
-            f"{self.adata.obs[perturbation_key].values[i]}"
-            for i in range(len(self.adata))
-        ])
-        self.cov_control = np.array([
-            f"{self.cov_names[i]}_"
-            f"{self.adata.obs[control_key].values[i]}"
-            for i in range(len(self.adata))
-        ])
-        
-        self.pert_dose = np.array([
-            f"{self.adata.obs[perturbation_key].values[i]}"
-            f"_{self.adata.obs[dose_key].values[i]}"
-            for i in range(len(self.adata))
-        ])
-        self.cov_pert_dose = np.array([
-            f"{self.cov_names[i]}_{self.pert_dose[i]}"
-            for i in range(len(self.adata))
-        ])
-
-        ## modified: commented out if de_genes not used downstream
-        """
-        if not ("rank_genes_groups_cov" in self.adata.uns):
-            self.adata.obs["cov_name"] = self.cov_names
-            self.adata.obs["cov_pert_name"] = self.cov_pert
-            print("Ranking genes for DE genes...")
-            rank_genes_groups(self.adata,
-                groupby="cov_pert_name",
-                reference="cov_name",
-                control_key=control_key)
-        self.de_genes = self.adata.uns["rank_genes_groups_cov"]
-        """
+        self.pert_dose = self.pert_names + "_" + self.doses
+        self.cov_pert = self.cov_names + "_" + self.pert_names
+        self.cov_pert_dose = self.cov_names + "_" + self.pert_dose
+        self.cov_control = self.cov_names + "_" + self.controls
 
         # Time to load dataset
         print(f"Dataset load has elapsed: {start - time.time():.2f} seconds.")
@@ -277,16 +250,16 @@ class Dataset:
     def __len__(self):
         return self.n_obs
 
- 
+
 class SubDataset_Pair:
     """
-    Subsets a `Dataset` by selecting the examples given by `indices`.
+    Memory-efficient subset of Dataset.
+    It does NOT copy any data — it only stores index references.
     """
 
     def __init__(self, dataset, indices):
         self.dataset = dataset  # Keep reference to parent
-        self.indices = indices  # Store which indices this subset uses
-
+        self.indices = np.array(indices, dtype=np.int64)  # store as numpy array
         self.sample_cf = dataset.sample_cf
         self.cf_samples = dataset.cf_samples
 
@@ -302,36 +275,73 @@ class SubDataset_Pair:
             self.perts_dict = dataset.perts_dict
         self.covars_dict = dataset.covars_dict
 
-        self.genes = dataset.genes[indices]
-        self.perturbations = indx(dataset.perturbations, indices)
-        self.controls = dataset.controls[indices]
-        self.covariates = [indx(cov, indices) for cov in dataset.covariates]
-
-        self.pert_names = indx(dataset.pert_names, indices)
-        self.doses = indx(dataset.doses, indices)
-
-        self.cov_names = indx(dataset.cov_names, indices)
-        self.cov_pert = indx(dataset.cov_pert, indices)
-        self.pert_dose = indx(dataset.pert_dose, indices)
-        self.cov_pert_dose = indx(dataset.cov_pert_dose, indices)
-        self.cov_control = indx(dataset.cov_control, indices)
+        # Keep references to parent dataset
+        self.genes = dataset.genes
+        self.perturbations = dataset.perturbations
+        self.controls = dataset.controls
+        self.covariates = dataset.covariates
+        self.pert_names = dataset.pert_names
+        self.doses = dataset.doses
+        self.cov_names = dataset.cov_names
+        self.cov_pert = dataset.cov_pert
+        self.pert_dose = dataset.pert_dose
+        self.cov_pert_dose = dataset.cov_pert_dose
+        self.cov_control = dataset.cov_control
         self.control_vals = '1'
-        
         self.var_names = dataset.var_names
-        self.n_obs = len(indices)
-        ## modified: commented out if de_genes not used downstream
-        #self.de_genes = dataset.de_genes
-
         self.num_covariates = dataset.num_covariates
         self.num_outcomes = dataset.num_outcomes
         self.num_treatments = dataset.num_treatments
-        # print(f"num_treatments in SubDataset_Pair: {self.num_treatments}")
 
         if self.sample_cf:
-            self.cov_pert_dose_idx = unique_ind(self.cov_pert_dose)
             self.cov_control_idx = unique_ind(self.cov_control)
 
+        self.n_obs = len(self.indices)
 
+    # Standard PyTorch Dataset interface
+    def __len__(self):
+        return self.n_obs
+
+    def __getitem__(self, i):
+
+        # Genes loaded on demand from disk
+
+        # Lookup real index in parent dataset
+        parent_idx = self.indices[i]
+
+        # Fetch treated genes
+        genes = torch.as_tensor(self.genes[parent_idx])
+
+        cf_genes = None
+        cf_i = 0
+
+        # Genes loaded in RAM
+        if self.sample_cf:
+            cov_name = self.cov_names[parent_idx]
+            cf_name = f"{cov_name}_{self.control_vals}"
+            if cf_name in self.cov_control_idx:
+                cf_candidates = self.cov_control_idx[cf_name]
+                cf_i = np.random.choice(cf_candidates)
+                cf_genes = torch.as_tensor(self.genes[cf_i])
+
+        if self.sample_cf:
+            cov_name = self.cov_names[parent_idx]
+            cf_name = f"{cov_name}_{self.control_vals}"
+            if cf_name in self.cov_control_idx:
+                cf_candidates = self.cov_control_idx[cf_name]
+                cf_i = np.random.choice(cf_candidates)
+                cf_genes = torch.as_tensor(self.genes[cf_i])
+
+        return (
+            genes,
+            self.perturbations[parent_idx],
+            cf_genes,
+            parent_idx,
+            cf_i,
+            *[cov[parent_idx] for cov in self.covariates]
+        )
+
+    # Subset to return SubDataset
     def subset_condition(self, control=True):
         if control is None:
             return self
@@ -339,55 +349,13 @@ class SubDataset_Pair:
             idx = np.where(self.controls == control)[0].tolist()
             return SubDataset(self, idx)
 
-    def __getitem__(self, i):
-        
-        ### get the control sample
-    
-        cf_pert_dose_name = self.control_names[0]
-        cf_genes = None
-        cf_i=0
-        covariate_name = indx(self.cov_names, i)
-        cf_name = covariate_name + f"_{self.control_vals}"
-        # print("cf_pert_dose_name {}".format(cf_pert_dose_name))
-
-        # Get counterfactual genes (from control)
-        if cf_name in self.cov_control:
-            cf_inds = self.cov_control_idx[cf_name]
-            cf_i = np.random.choice(cf_inds)
-            #parent_cf_i = self.indices[cf_i]
-            #cf_genes = self.dataset.adata.X[parent_cf_i,:]
-            #if scipy.sparse.issparse(cf_genes):
-            #    cf_genes = cf_genes.toarray().squeeze()
-            #cf_genes = torch.from_numpy(cf_genes)
-            cf_genes = torch.from_numpy(self.genes[cf_i]).float()
-        
-        ### get gene activations
-        parent_idx = self.indices[i]
-        #genes = self.dataset.adata.X[parent_idx,:]
-        #if scipy.sparse.issparse(genes):
-        #    genes = genes.toarray().squeeze()
-        #genes = torch.from_numpy(genes)
-        genes = torch.from_numpy(self.genes[i]).float()
-                        
-        return (
-            genes,
-            indx(self.perturbations, i),
-            cf_genes,
-            parent_idx, # ADDED: AnnData row indexes corresponding to each sample
-            cf_i,
-            *[indx(cov, i) for cov in self.covariates]
-        )
-
-    def __len__(self):
-        return self.n_obs
-
 class SubDataset:
     """
     Subsets a `SubDatasetPair` by selecting the examples given by `indices`.
     """
 
     def __init__(self, dataset, indices):
-        self.indices = indices
+        self.indices = np.array(indices, dtype=np.int64)
         self.parent_dataset = dataset
 
         self.sample_cf = dataset.sample_cf
@@ -398,12 +366,11 @@ class SubDataset:
         self.control_key = dataset.control_key
         self.dose_key = dataset.dose_key
         self.covariate_keys = dataset.covariate_keys
-
         self.control_names = dataset.control_names
+        self.covars_dict = dataset.covars_dict
 
         if self.perturbation_input == "ohe":
             self.perts_dict = dataset.perts_dict
-        self.covars_dict = dataset.covars_dict
 
         # Obtain gene expression data
         adata_indices = np.asarray(self.parent_dataset.indices)[indices]
