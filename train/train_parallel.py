@@ -21,7 +21,7 @@ from ..evaluate.evaluate import evaluate, evaluate_classic,evaluate_prediction
 from ..model.model_parallel import load_FCR
 
 
-from ..dataset.dataset import load_dataset_splits,load_dataset_train_test, get_dataset_features
+from ..dataset.dataset_parallel import load_dataset_splits,load_dataset_train_test, get_dataset_features
 
 from ..utils.general_utils import initialize_logger, ljson
 from ..utils.data_utils import data_collate
@@ -33,7 +33,7 @@ torch.autograd.set_detect_anomaly(True)
 
 ## MODIFIED: add split to select desired datastet
 ## MODIFIED: we will repeteadly load shards or partitions of an original dataset
-def prepare(args, features, shard_path, state_dict=None, split_name="train"):
+def prepare(args, features, shard_path, state_dict=None):
     """
     Instantiates dataset (partition).
     """
@@ -309,7 +309,7 @@ def train(args, prepare=prepare, state_dict=None):
                 if not (key in model.module.history.keys()):
                     model.module.history[key] = []
                 model.module.history[key].append(shard_training_stats[key])
-                
+
             if not "epoch_shard" in model.module.history.keys():
                 model.module.history["epoch_shard"] = []
             model.module.history["epoch_shard"].append(f"{epoch}_{shard_id}")

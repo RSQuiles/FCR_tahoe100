@@ -13,7 +13,7 @@ import re
 import math
 import matplotlib.colors as mcolors
 
-def compute_latents(trained_model, datasets, adata, batch_size, sample=False, max_samples=1e5):
+def compute_latents(trained_model, datasets, adata, batch_size, sample=False, max_samples=5_000):
     print("Computing latent representations...")
     indices = []
     ZXs = []
@@ -22,16 +22,16 @@ def compute_latents(trained_model, datasets, adata, batch_size, sample=False, ma
 
     trained_model.eval()
     with torch.no_grad():
-        for i, data in enumerate(datasets["loader_tr"]):
+        for i, data in enumerate(datasets["loader"]):
             if batch_size * i < max_samples:
-                (genes, perts, cf_genes, idx, _, covariates) = (
-                        data[0], data[1], data[2], data[3], data[4], data[5:])
+                (genes, perts, cf_genes, idx, covariates) = (
+                        data[0], data[1], data[2], data[3], data[4:])
 
                 ZX, ZXT, ZT = trained_model.get_latent_presentation(genes, perts, covariates, sample=sample)
                 ZXs.extend(ZX)
                 ZTs.extend(ZT)
                 ZXTs.extend(ZXT)
-                indices.append(idx.item())
+                indices.extend(idx.tolist())
 
             else:
                 break
@@ -203,7 +203,8 @@ def plot_umaps(model_dir, target_epoch=None, filter_dict=None, all_drugs=False, 
     output_dir = str(os.path.join(model_dir, "umaps"))
     os.makedirs(output_dir, exist_ok=True)
 
-    adata = sc.read(args["data_path"], backed="r")
+    # adata = sc.read(args["data_path"], backed="r")
+    adata = sc.read(args["data_path"])
     # Set batch size to determine number of samples to process
     batch_size = 256
     try:
@@ -211,7 +212,7 @@ def plot_umaps(model_dir, target_epoch=None, filter_dict=None, all_drugs=False, 
     except:
         pass
 
-    # Append latents to adata
+    # Compute subset AnnData with latents
     adata = compute_latents(model, datasets, adata, batch_size, sample=sample)
 
     # Apply filters if provided

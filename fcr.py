@@ -10,10 +10,9 @@ from .evaluate.evaluate import evaluate, evaluate_classic
 from .dataset.dataset import load_dataset_splits
 from .utils.general_utils import initialize_logger, ljson
 from .utils.data_utils import data_collate
+from .dataset.dataset import prepare_dataset
 import json
 import argparse
-# from .train import train
-# from .train import prepare
 
 """
 Fetch the latest model (path) given the directory where checkpoints are saved
@@ -69,7 +68,7 @@ def get_model(model_dir, target_epoch=None, dataset="all"):
 
     # LOAD MODEL AND DATASETS
     trained_model = fcr_model.model
-    datasets = fcr_model.dataset
+    datasets = fcr_model.datasets
 
     return [args, trained_model, datasets]
 
@@ -126,13 +125,16 @@ class FCR_sim:
             if "separate_outcomes_emb" not in self.arguments.keys():
                 self.arguments["separate_outcomes_emb"] = True
 
-            # Different prepare function depending on pararllel flag
+            # Load the dataset           
+            self.datasets = prepare_dataset(self.arguments, self.arguments["data_path"], split_name=dataset)
+
+            # Load the model
             if self.arguments.get("parallel", False):
-                from .train.train_parallel import prepare
-                self.model, self.dataset = prepare(self.arguments, world_size=1, rank=0, local_rank=0, state_dict=state_dict[0])
+                from .model.model_parallel import load_FCR
+                self.model = load_FCR(self.arguments, state_dict=state_dict[0])
             else:
-                from .train.train import prepare
-                self.model, self.dataset = prepare(self.arguments, state_dict[0], dataset)
+                from .model.model import load_FCR
+                self.model = load_FCR(self.arguments, state_dict=state_dict[0])
     
     def train_fcr(self, state_dict=None, parallel=False):
         """
