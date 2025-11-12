@@ -1338,7 +1338,7 @@ class FCR(nn.Module):
                     
 
     # Added: increase specified whether the metric should increase or decrease during training
-    def early_stopping(self, score, scheduler_autoencoder, scheduler_discriminator, increase=True):
+    def early_stopping(self, score, scheduler_autoencoder, scheduler_discriminator, increase=False):
         """
         Decays the learning rate, and possibly early-stops training.
         """

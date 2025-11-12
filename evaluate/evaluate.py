@@ -208,7 +208,7 @@ def evaluate_r2_classic(model, dataset, dataset_control, batch_size=None, min_sa
     ]
 
 # ADDED: eval flag enables the usage of the "eval" model, so that the original model is not used (crucial for DDP implementation)
-def evaluate_prediction(model, datasets, eval=False):
+def evaluate_prediction(model, datasets, args, eval=False):
     """
     `evaluate` used in CPA
     https://github.com/facebookresearch/CPA
@@ -219,41 +219,40 @@ def evaluate_prediction(model, datasets, eval=False):
         evaluation_stats = {
             "train": evaluate_prediction_r2(
                 model,
-                datasets["train"].subset_condition(control=False),
+                datasets["train"],
+                args,
                 eval=eval
             ),
             "test": evaluate_prediction_r2(
                 model,
-                datasets["test"].subset_condition(control=False),
+                datasets["test"],
+                args,
                 eval=eval
             )
         }
     return evaluation_stats
 
 ## Modified: eliminated batch_size argument
-def evaluate_prediction_r2(model, dataset, min_samples=30, eval=False):
+def evaluate_prediction_r2(model, dataset, args, min_samples=30, eval=False):
     """
     `evaluate_r2` used in CPA
     https://github.com/facebookresearch/CPA
     """
 
     mean_score, mean_score_de = [], []
-    genes = dataset.genes
-    perts = dataset.perturbations
 
-    for pert_category in np.unique(dataset.cov_pert):
-        # pert_category category contains: 'cov_pert' info
-        # de_idx = np.where(
-        #     dataset.var_names.isin(np.array(dataset.de_genes[pert_category]))
-        # )[0]
-        idx = np.where(dataset.cov_pert == pert_category)[0]
+    for pert_category in np.unique(dataset.dataset.cov_pert):
+        idx = np.where(dataset.dataset.cov_pert == pert_category)[0]
+        # Subset the indices
+        if len(idx) > args["batch_size"]:
+            idx = np.random.choice(idx, args["batch_size"], replace=False)
 
         # estimate metrics only for reasonably-sized perturbation/cell-type combos
         if len(idx) > min_samples:
-            print("The evaluation is happening!")
-            perts = dataset.perturbations[idx]
-            covars = [covar[idx] for covar in dataset.covariates]
-            genes = torch.from_numpy(dataset.genes[idx, :]).float()
+            # print("The evaluation is happening!")
+            perts = dataset.dataset.perturbations[idx]
+            covars = [covar[idx] for covar in dataset.dataset.covariates]
+            genes = dataset.dataset.genes[idx]
             num_eval = 0
             yp = [] 
             out = model.predict_self(
@@ -266,7 +265,7 @@ def evaluate_prediction_r2(model, dataset, min_samples=30, eval=False):
             yp = out.detach().cpu()
             yp_m = yp.mean(0)
             
-            yt = dataset.genes[idx, :]
+            yt = dataset.dataset.genes[idx]
             yt_m = yt.mean(axis=0)
 
             mean_score.append(r2_score(yt_m, yp_m))

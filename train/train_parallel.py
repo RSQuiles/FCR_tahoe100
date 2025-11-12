@@ -21,7 +21,7 @@ from ..evaluate.evaluate import evaluate, evaluate_classic,evaluate_prediction
 from ..model.model_parallel import load_FCR
 
 
-from ..dataset.dataset import load_dataset_splits,load_dataset_train_test
+from ..dataset.dataset import load_dataset_splits,load_dataset_train_test, get_dataset_features
 
 from ..utils.general_utils import initialize_logger, ljson
 from ..utils.data_utils import data_collate
@@ -31,11 +31,11 @@ from ..validation import plot_progression
 
 torch.autograd.set_detect_anomaly(True)
 
-## modified: add split to select desired datastet
-def prepare(args, world_size, rank, local_rank, state_dict=None, split_name="train"):
+## MODIFIED: add split to select desired datastet
+## MODIFIED: we will repeteadly load shards or partitions of an original dataset
+def prepare(args, features, shard_path, state_dict=None, split_name="train"):
     """
-    Instantiates model and dataset to run an experiment.
-    Gene shards will be updated later in the training loop.
+    Instantiates dataset (partition).
     """
     
     # dataset
@@ -57,7 +57,9 @@ def prepare(args, world_size, rank, local_rank, state_dict=None, split_name="tra
     embedded_dose = args.get("embedded_dose", None)
 
     datasets = load_dataset_train_test(
-    args["data_path"],
+    shard_path,
+    args,
+    features,
     perturbation_input = args.get("perturbation_input", "ohe"),
     covariate_keys = covariate_keys,
     perturbation_key = perturbation_key,
@@ -65,22 +67,9 @@ def prepare(args, world_size, rank, local_rank, state_dict=None, split_name="tra
     sample_cf=(True if args["dist_mode"] == "match" else False),
     control_name = control_name,
     embedded_dose = embedded_dose,
-    args = args,
     )
 
-    args["num_outcomes"] = datasets["train"].num_outcomes
-    args["num_treatments"] = datasets["train"].num_treatments
-    # print(f"num_treatments: {args['num_treatments']}")
-    args["num_covariates"] = datasets["train"].num_covariates
-
-    # model
-    model = load_FCR(args, state_dict)
-    model.to(local_rank)
-    # print("load FCR model")
-
-    args["hparams"] = model.hparams
-
-    return model, datasets
+    return datasets
 
 # FUNCTION TO SET UP PROCESS
 def setup(rank, world_size):
@@ -110,15 +99,39 @@ def train(args, prepare=prepare, state_dict=None):
     setup(rank, world_size)
     if rank == 0: print(f"Group initialized? {dist.is_initialized()}", flush=True)
 
+    # Only the Rank 0 process will log
+    log_proc = (rank == 0)
+
     local_rank = rank - gpus_per_node * (rank // gpus_per_node)
     torch.cuda.set_device(local_rank)
     print(f"host: {gethostname()}, rank: {rank}, local_rank: {local_rank}")
 
-    # Load Model and Datasets
-    if state_dict!=None:
-        model, datasets = prepare(args, world_size, rank, local_rank, state_dict)  
-    else:
-        model, datasets = prepare(args, world_size, rank, local_rank)
+    # Get global dataste features
+    if log_proc:
+        print("Obtaining global dataset features...")
+
+    features = {}
+    control_names, var_names, pert_unique, covars_dict, cf_genemap, num_treatments, num_outcomes, num_covariates = \
+    get_dataset_features(
+        args["data_path"],
+        covariate_keys = args["covariate_keys"],
+        perturbation_key = args["perturbation_key"],
+        control_key= args["control_key"]
+    )
+    features["control_names"] = control_names
+    features["var_names"] = var_names
+    features["pert_unique"] = pert_unique
+    features["covars_dict"] = covars_dict
+    features["cf_genemap"] = cf_genemap
+
+    # Load Model
+    args["num_outcomes"] = num_outcomes
+    args["num_treatments"] = num_treatments
+    args["num_covariates"] = num_covariates
+
+    model = load_FCR(args, state_dict)
+
+    args["hparams"] = model.hparams
 
     # Setup DDP model
     model.to(local_rank)
@@ -141,9 +154,6 @@ def train(args, prepare=prepare, state_dict=None):
         optimizer_discriminator, step_size=args["hparams"]["step_size_lr"]
     )
 
-    # Only the Rank 0 process will log
-    log_proc = (rank == 0)
-
     """
     Train the FCR model with DDP
     """
@@ -164,32 +174,52 @@ def train(args, prepare=prepare, state_dict=None):
         ljson({"model_params": model.module.hparams})
         logging.info("")
 
+    """
+    TRAINING LOOP:
+    - For each epoch:
+        - For each shard/partition of the dataset:
+            - Load shard
+            - Set Distributed DataLoader
+            - For each minibatch:
+                - Forward pass
+                - Backward pass
+                - Optimization step
+            - Log shard_training_stats each {checkpoint_frequency} shards
+
+        - Save model checkpoint each epoch
+        - Plot UMAPs for each model checkpoint
+    """
+
     start_time = time.time()
-    
-    # Set static graph to help DDP with alternating optimizer pattern
-    # Uncompatible for changing training like the one we implement here
-    # model._set_static_graph()
-    # if log_proc:
-    #     print("DDP static graph set")
 
     # Determine number of shards
     shard_path = Path(args["data_path"]).parent
-    shard_count = len(list(shard_path.glob("genes_part*")))
+    shard_count = len(list(shard_path.glob("adata_part*")))
 
+    stop = False
     for epoch in range(args["max_epochs"]):
+    
+        # Determine epoch time
+        epoch_start_time = time.time()
+
+        # Check stopping conditions
+        if stop:
+            break
 
         # Go over gene expression shards
         for shard_id in range(shard_count):
 
+            shard_training_stats = defaultdict(float)
+
+            if log_proc:
+                print(f"Loading shard {shard_id} for epoch {epoch}...")
+
             # Activate training mode
             model.train()
 
-            # Determine epoch time
-            epoch_start_time = time.time()
-
             # Update gene expression shard for this epoch
-            shard_file = shard_path / f"genes_part{shard_id}.npy"
-            datasets["train"].update_shard(str(shard_file), shard_id)
+            shard_file = shard_path / f"adata_part{shard_id}.h5ad"
+            datasets = prepare(args, features, shard_file)
 
             # Set Distributed DataLoader
             # Train Sampler ensures no overlapping samples between processes
@@ -210,11 +240,10 @@ def train(args, prepare=prepare, state_dict=None):
                         collate_fn=(lambda batch: data_collate(batch, nb_dims=1))
                     )
 
-            # TRAIN FOR ONE EPOCH:
+            # TRAIN FOR ONE (SUB)EPOCH:
             # Set epoch for DistributedSampler to reshuffle differently each epoch
             loader.sampler.set_epoch(epoch)
             
-            epoch_training_stats = defaultdict(float)
             # if (epoch % args["adv_epoch"]) == 0:
             if (shard_id % args["adv_epoch"]) == 0:
                 adv_training=True
@@ -226,12 +255,8 @@ def train(args, prepare=prepare, state_dict=None):
             for data in loader:
 
                 # print("Training with minibatch ", minibatch_counter)
-                (experiment, treatment, control, _, cf_i, covariates)= \
-                (data[0], data[1], data[2], data[3], data[4], data[5:])
-
-                if cf_i is None:
-                    # Skip samples without counterfactual in this shard
-                    continue
+                (experiment, treatment, control, _, covariates)= \
+                (data[0], data[1], data[2], data[3], data[4:])
 
                 # Freeze the discriminator if adv_training
                 if not adv_training:
@@ -271,74 +296,82 @@ def train(args, prepare=prepare, state_dict=None):
                 if (minibatch_counter % 5) == 0 and log_proc:
                     # print(f"Epoch {epoch} - Minibatch {minibatch_counter}")
                     print(f"Epoch {shard_id} - Minibatch {minibatch_counter}")
-                    print(f"Minibatch rate: {(time.time() - epoch_start_time)/minibatch_counter} sec")
+                    sec_per_mill_gpu = 1e6/((minibatch_counter * args['batch_size'])/(time.time() - epoch_start_time))
+                    hour_per_mill_gpu = sec_per_mill_gpu / 3600
+                    print(f"1M samples rate (1 GPU): {hour_per_mill_gpu} hours")
 
                 for key, val in minibatch_training_stats.items():
-                    epoch_training_stats[key] += val
+                    shard_training_stats[key] += val
 
-            # Clean cache
-            del loader, train_sampler
-            torch.cuda.empty_cache()
-
-        """
-        # Average epoch stats over number of minibatches
-        for key, val in epoch_training_stats.items():
-            epoch_training_stats[key] = val / len(datasets["loader_tr"])
-            if not (key in model.module.history.keys()):
-                model.module.history[key] = []
-            model.module.history[key].append(epoch_training_stats[key])
-        model.module.history["epoch"].append(epoch)
-
-        ellapsed_minutes = (time.time() - start_time) / 60
-        model.module.history["elapsed_time_min"] = ellapsed_minutes
-
-        # decay learning rate if necessary
-        # also check stopping condition: 
-        # patience ran out OR max epochs reached
-        stop = (epoch == args["max_epochs"] - 1)
-
-        # Only rank 0 process logs, saves the model checkpoint and performs evaluation
-        if ((epoch % args["checkpoint_freq"]) == 0 or stop) and log_proc:
-            # print("Performing evaluation...")
-            # Activate evaluation mode
-            model.eval()
-
-            evaluation_stats = evaluate_prediction(model.module, datasets)
-            for key, val in evaluation_stats.items():
+            # Average shard stats over number of minibatches
+            for key, val in shard_training_stats.items():
+                shard_training_stats[key] = val / len(loader)
                 if not (key in model.module.history.keys()):
                     model.module.history[key] = []
-                model.module.history[key].append(val)
-            model.module.history["stats_epoch"].append(epoch)
+                model.module.history[key].append(shard_training_stats[key])
+                
+            if not "epoch_shard" in model.module.history.keys():
+                model.module.history["epoch_shard"] = []
+            model.module.history["epoch_shard"].append(f"{epoch}_{shard_id}")
 
-            ljson(
-                {
-                    "epoch": epoch,
-                    "training_stats": epoch_training_stats,
-                    "evaluation_stats": evaluation_stats,
-                    "ellapsed_minutes": ellapsed_minutes,
-                    "Discriminator Training": adv_training
-                }
-            )
+            ellapsed_minutes = (time.time() - start_time) / 60
+            model.module.history["elapsed_time_min"] = ellapsed_minutes
 
-            # Log stats to WandB
-            all_stats = {}
-            for stat, value in epoch_training_stats.items():
-                all_stats[stat] = value
-            
-            for stat, value in evaluation_stats.items():
-                all_stats[stat] = value
+            # Only rank 0 logs
+            if ((shard_id % args["checkpoint_freq"]) == 0):
+                # print("Performing evaluation...")
+                # Activate evaluation mode
+                model.eval()
 
-            all_stats["ellapsed_minutes"] = ellapsed_minutes
-            all_stats["R2 Score Train (Mean)"] = evaluation_stats["train"][0]
-            all_stats["R2 Score Train (Stddev)"] = evaluation_stats["train"][1]
-            all_stats["R2 Score Test (Mean)"] = evaluation_stats["test"][0]
-            all_stats["R2 Score Test (Stddev)"] = evaluation_stats["test"][1]
+                evaluation_stats = evaluate_prediction(model.module, datasets, args)
+                for key, val in evaluation_stats.items():
+                    if not (key in model.module.history.keys()):
+                        model.module.history[key] = []
+                    model.module.history[key].append(val)
 
-            wandb.log(all_stats)
+                if log_proc:
+                    # Log stats to console and file
+                    ljson(
+                        {
+                            "epoch": epoch,
+                            "training_stats": shard_training_stats,
+                            "evaluation_stats": evaluation_stats,
+                            "ellapsed_minutes": ellapsed_minutes,
+                            "Discriminator Training": adv_training
+                        }
+                    )
 
-            for key, val in epoch_training_stats.items():
-                writer.add_scalar(key, val, epoch)
+                    # Log stats to WandB
+                    all_stats = {}
+                    for stat, value in shard_training_stats.items():
+                        all_stats[stat] = value
+                    
+                    for stat, value in evaluation_stats.items():
+                        all_stats[stat] = value
 
+                    all_stats["ellapsed_minutes"] = ellapsed_minutes
+                    all_stats["R2 Score Train (Mean)"] = evaluation_stats["train"][0]
+                    all_stats["R2 Score Train (Stddev)"] = evaluation_stats["train"][1]
+                    all_stats["R2 Score Test (Mean)"] = evaluation_stats["test"][0]
+                    all_stats["R2 Score Test (Stddev)"] = evaluation_stats["test"][1]
+
+                    wandb.log(all_stats)
+
+                    for key, val in shard_training_stats.items():
+                        writer.add_scalar(key, val, epoch)
+
+                # Step schedulers and check early stopping
+                stop = stop or model.module.early_stopping(shard_training_stats["KL Divergence"], scheduler_autoencoder, scheduler_discriminator)
+                if stop:
+                    ljson({"early_stop": epoch})
+                    break
+
+            # Clean cache for next shard
+            del loader, train_sampler
+            # torch.cuda.empty_cache()
+
+        # LOAD MODEL CHECKPOINT EACH EPOCH (Only rank 0 does)
+        if log_proc:
             torch.save(
                 (model.module.state_dict(), args, model.module.history),
                 os.path.join(
@@ -355,21 +388,16 @@ def train(args, prepare=prepare, state_dict=None):
                 }
             )
 
-        # Step schedulers and check early stopping
-        stop = stop or model.module.early_stopping(epoch_training_stats["KL Divergence"], scheduler_autoencoder, scheduler_discriminator)
-        if stop:
-            ljson({"early_stop": epoch})
-            break
+            # UMAP PLOTTING EACH EPOCH
+            print("Working on UMAP plotting modification...")
+            # plot_umaps(model_dir=args["artifact_path"], all_drugs=False, parallel=True)
+            # plot_progression(model_dir=args["artifact_path"], rep="ZXs", feature="cell_name", freq=100)
+            # plot_progression(model_dir=args["artifact_path"], rep="ZTs", feature="dose", freq=100)
 
-     # Rank 0 plots UMAPS
+        # Determine if last epoch
+        stop = stop or (epoch == args["max_epochs"] - 1)
+
     if log_proc:
-        print("Working on UMAP plotting modification...")
-        # plot_umaps(model_dir=args["artifact_path"], all_drugs=False, parallel=True)
-        # plot_progression(model_dir=args["artifact_path"], rep="ZXs", feature="cell_name", freq=100)
-        # plot_progression(model_dir=args["artifact_path"], rep="ZTs", feature="dose", freq=100)
-
         writer.close()
-        """
-
-    return 
+ 
 
