@@ -86,7 +86,7 @@ class FCR(nn.Module):
         dist_outcomes="normal",
         type_treatments=None,
         type_covariates=None, # If None, "object", "bool" or "category", embedding is done with Compound Embedding, else, with MLP
-        mc_sample_size=30,
+        mc_sample_size=5,
         best_score=None,
         patience=5,
         distance="element",

@@ -2,6 +2,7 @@ import os
 import time
 import logging
 from datetime import datetime
+from datetime import timedelta
 from collections import defaultdict
 import wandb
 import numpy as np
@@ -27,13 +28,13 @@ from ..utils.general_utils import initialize_logger, ljson
 from ..utils.data_utils import data_collate
 
 from ..validation import plot_umaps
-from ..validation import plot_progression
+# from ..validation import plot_progression
 
 torch.autograd.set_detect_anomaly(True)
 
 ## MODIFIED: add split to select desired datastet
 ## MODIFIED: we will repeteadly load shards or partitions of an original dataset
-def prepare(args, features, shard_path, state_dict=None):
+def prepare(args, features, shard_path):
     """
     Instantiates dataset (partition).
     """
@@ -74,7 +75,7 @@ def prepare(args, features, shard_path, state_dict=None):
 # FUNCTION TO SET UP PROCESS
 def setup(rank, world_size):
     # initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timedelta(minutes=60))
 
 
 def train(args, prepare=prepare, state_dict=None):
@@ -196,8 +197,11 @@ def train(args, prepare=prepare, state_dict=None):
     shard_path = Path(args["data_path"]).parent
     shard_count = len(list(shard_path.glob("adata_part*")))
 
+    start_epoch = args.get("epoch", 0)  # in case the training is resumed from a checkpoint
+    print(f"Starting training from epoch {start_epoch}")
+
     stop = False
-    for epoch in range(args["max_epochs"]):
+    for epoch in range(start_epoch, args["max_epochs"]):
     
         # Determine epoch time
         epoch_start_time = time.time()
@@ -208,49 +212,65 @@ def train(args, prepare=prepare, state_dict=None):
 
         # Go over gene expression shards
         for shard_id in range(shard_count):
+            # All ranks start assuming no error
+            error_flag = torch.zeros(1, device=local_rank)
 
-            shard_training_stats = defaultdict(float)
+            # SHARD PREPARATION WITH ERROR SYNCRONIZATION ACROSS RANKS
+            try: 
+                shard_training_stats = defaultdict(float)
+                shard_start_time = time.time()
 
-            if log_proc:
-                print(f"Loading shard {shard_id} for epoch {epoch}...")
+                if log_proc:
+                    print(f"Loading shard {shard_id} for epoch {epoch}...")
 
-            # Activate training mode
+                # Update gene expression shard for this epoch
+                shard_file = shard_path / f"adata_part{shard_id}.h5ad"
+                datasets = prepare(args, features, shard_file)
+
+                # Set Distributed DataLoader
+                # Train Sampler ensures no overlapping samples between processes
+                train_sampler = torch.utils.data.distributed.DistributedSampler(datasets["train"],
+                                                                                num_replicas=world_size,
+                                                                                rank=rank,
+                                                                                shuffle=False
+                                                                                )
+                
+                loader =  torch.utils.data.DataLoader(
+                            datasets["train"],
+                            batch_size=args["batch_size"],
+                            sampler=train_sampler,
+                            num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]),
+                            prefetch_factor=4,
+                            pin_memory = True,
+                            persistent_workers=False,
+                            drop_last=True,
+                            collate_fn=(lambda batch: data_collate(batch, nb_dims=1))
+                        )
+
+                # Set epoch for DistributedSampler to reshuffle differently each epoch
+                loader.sampler.set_epoch(epoch)
+                
+                # if (epoch % args["adv_epoch"]) == 0:
+                if (shard_id % args["adv_epoch"]) == 0:
+                    adv_training=True
+                else:
+                    adv_training=False
+                # print("Adversarial Training {}".format(adv_training))
+
+            except Exception as e:
+                print(f"[Prep error] Rank {rank} failed shard {shard_id}: {e}")
+                error_flag[0] = 1
+
+            # Sync shard prep status
+            dist.all_reduce(error_flag, op=dist.ReduceOp.SUM)
+            if error_flag.item() > 0:
+                if log_proc:
+                    print(f"Skipping shard {shard_id} on all ranks due to prep error.")
+                dist.barrier()
+                continue
+
+            # MODEL TRAINING FOR CURRENT SHARD
             model.train()
-
-            # Update gene expression shard for this epoch
-            shard_file = shard_path / f"adata_part{shard_id}.h5ad"
-            datasets = prepare(args, features, shard_file)
-
-            # Set Distributed DataLoader
-            # Train Sampler ensures no overlapping samples between processes
-            train_sampler = torch.utils.data.distributed.DistributedSampler(datasets["train"],
-                                                                            num_replicas=world_size,
-                                                                            rank=rank,
-                                                                            shuffle=False
-                                                                            )
-            
-            loader =  torch.utils.data.DataLoader(
-                        datasets["train"],
-                        batch_size=args["batch_size"],
-                        sampler=train_sampler,
-                        num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]),
-                        prefetch_factor=4,
-                        pin_memory = True,
-                        persistent_workers=True,
-                        collate_fn=(lambda batch: data_collate(batch, nb_dims=1))
-                    )
-
-            # TRAIN FOR ONE (SUB)EPOCH:
-            # Set epoch for DistributedSampler to reshuffle differently each epoch
-            loader.sampler.set_epoch(epoch)
-            
-            # if (epoch % args["adv_epoch"]) == 0:
-            if (shard_id % args["adv_epoch"]) == 0:
-                adv_training=True
-            else:
-                adv_training=False
-            # print("Adversarial Training {}".format(adv_training))
-
             minibatch_counter = 0
             for data in loader:
 
@@ -294,9 +314,8 @@ def train(args, prepare=prepare, state_dict=None):
 
                 # Logging minibatches
                 if (minibatch_counter % 5) == 0 and log_proc:
-                    # print(f"Epoch {epoch} - Minibatch {minibatch_counter}")
-                    print(f"Epoch {shard_id} - Minibatch {minibatch_counter}")
-                    sec_per_mill_gpu = 1e6/((minibatch_counter * args['batch_size'])/(time.time() - epoch_start_time))
+                    print(f"Epoch {epoch} - Shard {shard_id} - Minibatch {minibatch_counter}")
+                    sec_per_mill_gpu = 1e6/((minibatch_counter * args['batch_size'])/(time.time() - shard_start_time))
                     hour_per_mill_gpu = sec_per_mill_gpu / 3600
                     print(f"1M samples rate (1 GPU): {hour_per_mill_gpu} hours")
 
@@ -361,15 +380,23 @@ def train(args, prepare=prepare, state_dict=None):
                         writer.add_scalar(key, val, epoch)
 
                 # Step schedulers and check early stopping
-                stop = stop or model.module.early_stopping(shard_training_stats["KL Divergence"], scheduler_autoencoder, scheduler_discriminator)
-                if stop:
-                    ljson({"early_stop": epoch})
-                    break
+                model.module.early_stopping(shard_training_stats["KL Divergence"], scheduler_autoencoder, scheduler_discriminator)
+                # TEMPORARILY DISABLED EARLY STOP
+                # stop = stop or model.module.early_stopping(shard_training_stats["KL Divergence"], scheduler_autoencoder, scheduler_discriminator)
+                # if stop:
+                #     ljson({"early_stop": epoch})
+                #     break
+
+            # Syncronize ranks before next shard
+            dist.barrier()
 
             # Clean cache for next shard
             del loader, train_sampler
             # torch.cuda.empty_cache()
 
+
+        # Fence rank 0 operations
+        dist.barrier()
         # LOAD MODEL CHECKPOINT EACH EPOCH (Only rank 0 does)
         if log_proc:
             torch.save(
@@ -389,15 +416,21 @@ def train(args, prepare=prepare, state_dict=None):
             )
 
             # UMAP PLOTTING EACH EPOCH
-            print("Working on UMAP plotting modification...")
-            # plot_umaps(model_dir=args["artifact_path"], all_drugs=False, parallel=True)
+            print(f"Plotting UMAPs for epoch {epoch}!")
+            plot_raw = True if epoch == 0 else False
+            # plot_umaps(model_dir=args["artifact_path"], n_checkpoint=epoch, plot_raw=plot_raw, all_drugs=False, sample=True)
             # plot_progression(model_dir=args["artifact_path"], rep="ZXs", feature="cell_name", freq=100)
             # plot_progression(model_dir=args["artifact_path"], rep="ZTs", feature="dose", freq=100)
+
+        dist.barrier()
 
         # Determine if last epoch
         stop = stop or (epoch == args["max_epochs"] - 1)
 
     if log_proc:
         writer.close()
+
+    # Cleanup the distributed backend
+    dist.destroy_process_group()
  
 

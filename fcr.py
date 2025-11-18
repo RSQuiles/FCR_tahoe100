@@ -79,7 +79,11 @@ This class allows to:
 - Import a model given the path to the checkpoint file
 """
 class FCR_sim:
-    def __init__(self, config_path=None, model_path=None, dataset_mode="train", parameters=None,
+    def __init__(self, 
+                 config_path=None, 
+                 model_path=None, 
+                 dataset_mode="train", 
+                 parameters=None,
                  parallel=False):
         # Importing mode for dataset
         self.dataset_mode = dataset_mode
@@ -118,6 +122,7 @@ class FCR_sim:
             raise FileNotFoundError("The model_path specified does not exist")
         else:
             state_dict = torch.load(model_path)
+            self.state_dict = state_dict[0]
             self.arguments = state_dict[1]
             # For retrocompatibility
             if "sweep" not in self.arguments.keys():
