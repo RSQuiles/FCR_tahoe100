@@ -144,7 +144,9 @@ def train(args, prepare=prepare, state_dict=None):
                                        weight_decay=args["hparams"]["autoencoder_wd"]
                                        )
     scheduler_autoencoder = torch.optim.lr_scheduler.StepLR(
-        optimizer_autoencoder, step_size=args["hparams"]["step_size_lr"]
+        optimizer_autoencoder, 
+        step_size=args["hparams"]["step_size_lr"],
+        gamma=1
     )
 
     optimizer_discriminator = optim.Adam(ddp_model.module.params_discriminator,
@@ -152,7 +154,9 @@ def train(args, prepare=prepare, state_dict=None):
                                        weight_decay=args["hparams"]["discriminator_wd"]
                                        )
     scheduler_discriminator = torch.optim.lr_scheduler.StepLR(
-        optimizer_discriminator, step_size=args["hparams"]["step_size_lr"]
+        optimizer_discriminator,
+        step_size=args["hparams"]["step_size_lr"],
+        gamma=1
     )
 
     """
@@ -202,6 +206,10 @@ def train(args, prepare=prepare, state_dict=None):
 
     stop = False
     for epoch in range(start_epoch, args["max_epochs"]):
+
+        # Randomly shuffle shard order
+        rng = np.random.default_rng(args.get("seed", 0) + epoch)
+        rand_shard_ids = rng.permutation(shard_count)
     
         # Determine epoch time
         epoch_start_time = time.time()
@@ -212,6 +220,9 @@ def train(args, prepare=prepare, state_dict=None):
 
         # Go over gene expression shards
         for shard_id in range(shard_count):
+            # Choose random shard index
+            rand_shard_id = rand_shard_ids[shard_id]
+
             # All ranks start assuming no error
             error_flag = torch.zeros(1, device=local_rank)
 
@@ -221,10 +232,10 @@ def train(args, prepare=prepare, state_dict=None):
                 shard_start_time = time.time()
 
                 if log_proc:
-                    print(f"Loading shard {shard_id} for epoch {epoch}...")
+                    print(f"Loading shard {shard_id} (id {rand_shard_id}) for epoch {epoch}...")
 
                 # Update gene expression shard for this epoch
-                shard_file = shard_path / f"adata_part{shard_id}.h5ad"
+                shard_file = shard_path / f"adata_part{rand_shard_id}.h5ad"
                 datasets = prepare(args, features, shard_file)
 
                 # Set Distributed DataLoader
@@ -232,7 +243,7 @@ def train(args, prepare=prepare, state_dict=None):
                 train_sampler = torch.utils.data.distributed.DistributedSampler(datasets["train"],
                                                                                 num_replicas=world_size,
                                                                                 rank=rank,
-                                                                                shuffle=False
+                                                                                shuffle=True
                                                                                 )
                 
                 loader =  torch.utils.data.DataLoader(
@@ -250,22 +261,22 @@ def train(args, prepare=prepare, state_dict=None):
                 # Set epoch for DistributedSampler to reshuffle differently each epoch
                 loader.sampler.set_epoch(epoch)
                 
-                # if (epoch % args["adv_epoch"]) == 0:
-                if (shard_id % args["adv_epoch"]) == 0:
+                # Set adversarial training flag
+                if (epoch % args["adv_epoch"]) == 0 and epoch > 0:
                     adv_training=True
                 else:
                     adv_training=False
                 # print("Adversarial Training {}".format(adv_training))
 
             except Exception as e:
-                print(f"[Prep error] Rank {rank} failed shard {shard_id}: {e}")
+                print(f"[Prep error] Rank {rank} failed shard {rand_shard_id}: {e}")
                 error_flag[0] = 1
 
             # Sync shard prep status
             dist.all_reduce(error_flag, op=dist.ReduceOp.SUM)
             if error_flag.item() > 0:
                 if log_proc:
-                    print(f"Skipping shard {shard_id} on all ranks due to prep error.")
+                    print(f"Skipping shard {rand_shard_id} on all ranks due to prep error.")
                 dist.barrier()
                 continue
 
@@ -278,7 +289,7 @@ def train(args, prepare=prepare, state_dict=None):
                 (experiment, treatment, control, _, covariates)= \
                 (data[0], data[1], data[2], data[3], data[4:])
 
-                # Freeze the discriminator if adv_training
+                # Freeze the discriminator if not adv_training
                 if not adv_training:
                     model.module.freeze_discriminator(True)
 
@@ -308,13 +319,13 @@ def train(args, prepare=prepare, state_dict=None):
 
                 # Unfreeze discriminator after iteration
                 if not adv_training:
-                    model.module.freeze_discriminator(True)
+                    model.module.freeze_discriminator(False)
 
                 minibatch_counter += 1
 
                 # Logging minibatches
-                if (minibatch_counter % 5) == 0 and log_proc:
-                    print(f"Epoch {epoch} - Shard {shard_id} - Minibatch {minibatch_counter}")
+                if minibatch_counter == 3 and log_proc:
+                    print(f"Epoch {epoch} - Shard {rand_shard_id} - Minibatch {minibatch_counter}")
                     sec_per_mill_gpu = 1e6/((minibatch_counter * args['batch_size'])/(time.time() - shard_start_time))
                     hour_per_mill_gpu = sec_per_mill_gpu / 3600
                     print(f"1M samples rate (1 GPU): {hour_per_mill_gpu} hours")
@@ -418,7 +429,7 @@ def train(args, prepare=prepare, state_dict=None):
             # UMAP PLOTTING EACH EPOCH
             print(f"Plotting UMAPs for epoch {epoch}!")
             plot_raw = True if epoch == 0 else False
-            # plot_umaps(model_dir=args["artifact_path"], n_checkpoint=epoch, plot_raw=plot_raw, all_drugs=False, sample=True)
+            plot_umaps(model_dir=args["artifact_path"], n_checkpoint=epoch, plot_raw=plot_raw, all_drugs=False, sample=False)
             # plot_progression(model_dir=args["artifact_path"], rep="ZXs", feature="cell_name", freq=100)
             # plot_progression(model_dir=args["artifact_path"], rep="ZTs", feature="dose", freq=100)
 

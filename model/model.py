@@ -246,31 +246,30 @@ class FCR(nn.Module):
         
         ## control encoder brings in control-specific latent path
         self.control_encoder = self.init_encoder_control()
-        self.params_autoencoder.extend(list(self.encoder_ZX.parameters()))
-        self.params_autoencoder.extend(list(self.encoder_ZT.parameters()))
-        self.params_autoencoder.extend(list(self.encoder_ZXT.parameters()))
-        self.params_autoencoder.extend(list(self.control_encoder.parameters()))
+        params.extend(list(self.encoder_ZX.parameters()))
+        params.extend(list(self.encoder_ZT.parameters()))
+        params.extend(list(self.encoder_ZXT.parameters()))
+        params.extend(list(self.control_encoder.parameters()))
 
         ## initialize the prior encoders
         self.encoder_ZX_prior = self.init_encoder_X_prior()
         self.encoder_ZT_prior = self.init_encoder_T_prior()
         self.encoder_ZXT_prior = self.init_encoder_XT_prior()
         self.control_prior = self.init_control_prior()
-        self.params_autoencoder.extend(list(self.encoder_ZX_prior.parameters()))
-        self.params_autoencoder.extend(list(self.encoder_ZT_prior.parameters()))
-        self.params_autoencoder.extend(list(self.encoder_ZXT_prior.parameters()))
-        self.params_autoencoder.extend(list(self.control_prior.parameters()))
+        params.extend(list(self.encoder_ZX_prior.parameters()))
+        params.extend(list(self.encoder_ZT_prior.parameters()))
+        params.extend(list(self.encoder_ZXT_prior.parameters()))
+        params.extend(list(self.control_prior.parameters()))
 
         # Decoder
         self.decoder = self.init_decoder_experiments()
-        self.params_autoencoder.extend(list(self.decoder.parameters()))
+        params.extend(list(self.decoder.parameters()))
         self.control_decoder = self.init_decoder_control()
-        self.params_autoencoder.extend(list(self.control_decoder.parameters()))
+        params.extend(list(self.control_decoder.parameters()))
 
         # Covariate decoder
         self.cov_decoder = self.init_decoder_cov()
-        self.params_autoencoder.extend(list(self.cov_decoder.parameters()))
-
+        params.extend(list(self.cov_decoder.parameters()))
         # Intervention decoder
         # print("intervention decoder style {}".format(self.distance))
         if self.distance == "cosine":
@@ -281,7 +280,7 @@ class FCR(nn.Module):
             self.interv_decoder = self.init_decoder_interv_concat()
         elif self.distance=="single":
             self.interv_decoder = self.init_decoder_interv_single()
-        self.params_autoencoder.extend(list(self.interv_decoder.parameters()))
+        params.extend(list(self.interv_decoder.parameters()))
 
         # FCR modules
         self.fcr_modules = [
@@ -292,13 +291,18 @@ class FCR(nn.Module):
             self.control_encoder,
             self.decoder]
 
-        # Eval models
+        # Eval networks
         self.exp_encoder_eval = copy.deepcopy(self.exp_encoder)
         self.encoder_ZX_eval = copy.deepcopy(self.encoder_ZX)
         self.encoder_ZT_eval = copy.deepcopy(self.encoder_ZT)
         self.encoder_ZXT_eval = copy.deepcopy(self.encoder_ZXT)
+
+        self.encoder_ZX_prior_eval = copy.deepcopy(self.encoder_ZX_prior)
+        self.encoder_ZT_prior_eval = copy.deepcopy(self.encoder_ZT_prior)
+        self.encoder_ZXT_prior_eval = copy.deepcopy(self.encoder_ZXT_prior)
         self.control_encoder_eval = copy.deepcopy(self.control_encoder)
-        self.decoder_eval = copy.deepcopy(self.decoder)
+        self.control_prior_eval = copy.deepcopy(self.control_prior)
+        # self.decoder_eval = copy.deepcopy(self.decoder)
 
         self.eval_modules = [
             self.exp_encoder_eval,
@@ -306,7 +310,8 @@ class FCR(nn.Module):
             self.encoder_ZT_eval,
             self.encoder_ZXT_eval,
             self.control_encoder_eval,
-            self.decoder_eval]
+            # self.decoder_eval,
+            ]
 
         # optimizer
         self.optimizer_autoencoder = torch.optim.Adam(

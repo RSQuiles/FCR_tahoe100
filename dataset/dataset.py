@@ -420,7 +420,7 @@ def prepare_dataset(args, data_path, split_name, state_dict=None, max_size = 500
     perturbation_input = args.get("perturbation_input", "ohe"),
     covariate_keys = covariate_keys,
     perturbation_key = perturbation_key,
-    split_key = args["split_key"],
+    split_key = args.get("split_key", "split"),
     sample_cf=(True if args["dist_mode"] == "match" else False),
     control_name = control_name,
     embedded_dose = embedded_dose,
@@ -433,7 +433,7 @@ def prepare_dataset(args, data_path, split_name, state_dict=None, max_size = 500
             "loader": torch.utils.data.DataLoader(
                 datasets[0][split_name],
                 batch_size=args["batch_size"],
-                shuffle=True,
+                shuffle=False,
                 collate_fn=(lambda batch: data_collate(batch, nb_dims=1))
             )
         }

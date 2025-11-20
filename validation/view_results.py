@@ -236,37 +236,43 @@ def plot_umaps(model_dir,
 
     # Apply filters if provided
     if drug_dict is not None:
-        adata_drug, filter_suffix = filter_adata(adata, drug_dict)
+        adata_drug, drug_suffix = filter_adata(adata, drug_dict)
     else:
         drug_suffix = ""
         adata_drug = adata
 
+    if cell_dict is not None:
+        adata_cell, cell_suffix = filter_adata(adata, cell_dict)
+    else:
+        cell_suffix = ""
+        adata_cell = adata
+
     # Plot ZX
     print("Plotting ZX UMAP...")
-    fig = umap(adata, rep="ZXs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
+    fig = umap(adata_cell, rep="ZXs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
     if show_figs:
         plt.show()
     else:
-        fig.savefig(os.path.join(output_dir,"UMAP_ZXs.png"), dpi=300, bbox_inches="tight")
+        fig.savefig(os.path.join(output_dir,f"UMAP_ZXs{cell_suffix}.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
     # Plot ZXT
     print("Plotting ZXT UMAP...")
-    fig = umap(adata, rep="ZXTs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
+    fig = umap(adata_cell, rep="ZXTs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
     if show_figs:
         plt.show()
     else:
-        fig.savefig(os.path.join(output_dir,f"UMAP_ZXTs.png"), dpi=300, bbox_inches="tight")
+        fig.savefig(os.path.join(output_dir,f"UMAP_ZXTs{cell_suffix}.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
     if not all_drugs:
         # Plot ZT
         print("Plotting ZT UMAP...")
-        fig = umap(adata_sub, rep="ZTs", color=["dose", "Agg_Treatment", "cell_name"], return_fig=True)
+        fig = umap(adata_drug, rep="ZTs", color=["dose", "Agg_Treatment", "cell_name"], return_fig=True)
         if show_figs:
             plt.show()
         else:
-            fig.savefig(os.path.join(output_dir,f"UMAP_ZTs{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+            fig.savefig(os.path.join(output_dir,f"UMAP_ZTs{drug_suffix}.png"), dpi=300, bbox_inches="tight")
         plt.close()
         
     # Option: print ZT against all drugs
@@ -298,14 +304,13 @@ def plot_umaps(model_dir,
         else:
             fig.savefig(os.path.join(output_dir,"UMAP_treatment.png"), dpi=300, bbox_inches="tight")
 
-        fig = raw_umap(adata_sub, feature="dose")
+        fig = raw_umap(adata_drug, feature="dose")
         if show_figs:
             plt.show()
         else:
-            fig.savefig(os.path.join(output_dir,f"UMAP_dose{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+            fig.savefig(os.path.join(output_dir,f"UMAP_dose{drug_suffix}.png"), dpi=300, bbox_inches="tight")
 
-
-def plot_progression(model_dir, rep, feature, last_epoch=None, freq=50, n_cols=5):
+def plot_progression(model_dir, rep, feature, sample=False, last_epoch=None, freq=50, n_cols=5):
     from ..fcr import fetch_latest
     from ..fcr import get_model
 
@@ -333,8 +338,10 @@ def plot_progression(model_dir, rep, feature, last_epoch=None, freq=50, n_cols=5
     save_path = str(os.path.join(output_dir, filename))
 
     # Import AnnData
-    args, model, datasets = get_model(model_dir)
-    adata = sc.read(args["data_path"], backed="r") # Backed mode to avoid memory issues
+    args, model, datasets = get_model(model_dir, target_epoch=None)
+    splits = datasets[0]
+    adata = datasets[1].adata
+    # adata = sc.read(args["data_path"], backed="r") # Backed mode to avoid memory issues
 
     for i, ax in enumerate(axes):
         if target_epoch > last_epoch:
@@ -347,7 +354,7 @@ def plot_progression(model_dir, rep, feature, last_epoch=None, freq=50, n_cols=5
 
         else:
             retrieved = get_model(model_dir, target_epoch)
-            args, model, datasets  = retrieved[0], retrieved[1], retrieved[2]
+            model  = retrieved[1]
             # Set batch size to determine number of samples to process
             batch_size = 256
             try:
@@ -355,7 +362,7 @@ def plot_progression(model_dir, rep, feature, last_epoch=None, freq=50, n_cols=5
             except:
                 pass
 
-            adata = compute_latents(model, datasets, adata, batch_size)
+            adata = compute_latents(model, splits, adata, batch_size, sample=sample)
 
             f = umap(adata, rep=rep, return_fig=False, ax=ax, title=f"Epoch {target_epoch}")
 
