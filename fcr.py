@@ -56,21 +56,24 @@ def fetch_latest(directory, suffix=".pt", target_epoch=None):
     latest_ckpt = max(ckpts, key=os.path.getmtime)
     return latest_ckpt # returns the string path of the latest checkpoint file
 
-def get_model(model_dir, target_epoch=None, dataset="all"):
+def get_model(model_dir, target_epoch=None, dataset="all", return_dataset=True):
     # Get path to model checkpoint
     model_path = fetch_latest(model_dir, target_epoch=target_epoch)
     print(f"Model path: {model_path}")
 
     # LOAD ARGUMENTS
     # Note: dataset_mode defines which dataset split will be in the loader
-    fcr_model = FCR_sim(model_path=model_path, dataset_mode=dataset)
+    fcr_model = FCR_sim(model_path=model_path, dataset_mode=dataset, return_dataset=return_dataset)
     args = fcr_model.arguments
 
     # LOAD MODEL AND DATASETS
     trained_model = fcr_model.model
-    datasets = fcr_model.datasets
 
-    return [args, trained_model, datasets]
+    if return_dataset:
+        datasets = fcr_model.datasets
+        return [args, trained_model, datasets]
+    else:
+        return [args, trained_model]
 
 
 """
@@ -84,11 +87,13 @@ class FCR_sim:
                  model_path=None, 
                  dataset_mode="train", 
                  parameters=None,
-                 parallel=False):
+                 parallel=False,
+                 return_dataset=True
+                 ):
         # Importing mode for dataset
         self.dataset_mode = dataset_mode
         if model_path != None:
-            self.load_model(model_path, self.dataset_mode)
+            self.load_model(model_path, self.dataset_mode, return_dataset=return_dataset)
         elif config_path != None:
             self.arguments = self.parse_arguments(config_path, parameters)
         else:
@@ -116,12 +121,12 @@ class FCR_sim:
         
         return arguments
 
-    def load_model(self, model_path, dataset):
+    def load_model(self, model_path, dataset, return_dataset=True):
 
         if not os.path.isfile(model_path):
             raise FileNotFoundError("The model_path specified does not exist")
         else:
-            state_dict = torch.load(model_path)
+            state_dict = torch.load(model_path, weights_only=False)
             self.state_dict = state_dict[0]
             self.arguments = state_dict[1]
             # For retrocompatibility
@@ -130,8 +135,10 @@ class FCR_sim:
             if "separate_outcomes_emb" not in self.arguments.keys():
                 self.arguments["separate_outcomes_emb"] = True
 
-            # Load the dataset           
-            self.datasets = prepare_dataset(self.arguments, self.arguments["data_path"], split_name=dataset)
+            # Load the dataset
+            if return_dataset:
+                self.arguments.pop("split_name", None)           
+                self.datasets = prepare_dataset(self.arguments, self.arguments["data_path"], split_name=dataset)
 
             # Load the model
             if self.arguments.get("parallel", False):

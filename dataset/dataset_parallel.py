@@ -21,6 +21,7 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 
 def get_dataset_features(data_path: str,
             perturbation_key="perturbation",
+            perturbation_input="ohe",
             control_key="control",
             covariate_keys="covariates",
             ):
@@ -32,7 +33,24 @@ def get_dataset_features(data_path: str,
     var_names = adata.var_names
     pert_unique = np.array(get_unique_perts(adata, perturbation_key))
 
-    num_treatments = len(pert_unique)
+    # num_treatments := size of the perturbation embedding
+    if perturbation_input == "ohe":
+        num_treatments = len(pert_unique)
+    elif perturbation_input in ["chemberta", "morgan", "maccs"]:
+        # Load drug metadata to get embedding size
+        drug_metadata_path = "/cluster/work/bewi/data/tahoe100/metadata/drug_metadata.parquet"
+        drug_df = pd.read_parquet(drug_metadata_path)
+        sample_drug = pert_unique[0]
+        if sample_drug not in drug_df["drug"].values:
+            raise ValueError(f"Drug {sample_drug} not found in drug metadata for embedding size inference.")
+        if perturbation_input == "chemberta":
+            embedding_size = len(drug_df.loc[drug_df["drug"] == sample_drug, "chemberta"].values[0])
+        elif perturbation_input == "morgan":
+            embedding_size = len(drug_df.loc[drug_df["drug"] == sample_drug, "morgan_fp"].values[0])
+        elif perturbation_input == "maccs":
+            embedding_size = len(drug_df.loc[drug_df["drug"] == sample_drug, "maccs_fp"].values[0])
+        num_treatments = embedding_size
+
     num_outcomes = adata.n_vars
 
     if not isinstance(covariate_keys, list):
@@ -246,21 +264,33 @@ class Dataset:
         elif self.perturbation_input == "chemberta":
             print("Using ChemBERTa embeddings for perturbations!")
             drug_df = pd.read_parquet(drug_metadata_path)
-            self.perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "chemberta"].values[0])
+            perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "chemberta"].values[0])
                                         for pert in self.pert_names])
+            # Multiply by dose to generate unique embeddings for each drug-dosage combination
+            doses = pd.to_numeric(self.adata.obs[dose_key], errors="coerce").fillna(0).values.astype(np.float32)
+            dose_tensor = torch.from_numpy(doses).float()
+            self.perturbations = perturbations * dose_tensor.unsqueeze(1)
             
         elif self.perturbation_input == "morgan":
             print("Using Morgan fingerprints for perturbations!")
             drug_df = pd.read_parquet(drug_metadata_path)
-            self.perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "morgan_fp"].values[0])
+            perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "morgan_fp"].values[0])
                                         for pert in self.pert_names])
-            
+            # Multiply by dose to generate unique embeddings for each drug-dosage combination
+            doses = pd.to_numeric(self.adata.obs[dose_key], errors="coerce").fillna(0).values.astype(np.float32)
+            dose_tensor = torch.from_numpy(doses).float()
+            self.perturbations = perturbations * dose_tensor.unsqueeze(1)
+
         elif self.perturbation_input == "maccs":
             print("Using MACCS keys for perturbations!")
             drug_df = pd.read_parquet(drug_metadata_path)
-            self.perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "maccs_fp"].values[0])
+            perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "maccs_fp"].values[0])
                                         for pert in self.pert_names])
-            
+            # Multiply by dose to generate unique embeddings for each drug-dosage combination
+            doses = pd.to_numeric(self.adata.obs[dose_key], errors="coerce").fillna(0).values.astype(np.float32)
+            dose_tensor = torch.from_numpy(doses).float()
+            self.perturbations = perturbations * dose_tensor.unsqueeze(1)
+                        
         else:
             raise NotImplementedError("Unmatched input mode for treatments")
 

@@ -14,10 +14,58 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, classification_report
 from typing import Dict, Tuple, Optional, Union, Any
 
-# from ..fcr import get_model, FCR_sim
+from ..fcr import get_model, FCR_sim
 from ..utils.data_utils import data_collate
 from .view_results import compute_latents
+from ..dataset.dataset import prepare_dataset
 
+def generate_embeddings(model_dir, adata=None, data_path=None, target_epoch=None, return_adata=False):
+    """
+    Load a trained FCR model and compute embeddings (latents) for the given data.
+    
+    Parameters
+    ----------
+    model_dir : str
+        Path to the directory containing the trained model checkpoints and config
+    data_path : str
+        Path to the AnnData object to compute latents for
+    target_epoch : int, optional
+        Specific epoch checkpoint to load. If None, loads the latest checkpoint
+        
+    Returns
+    -------
+    latents : dict
+        Dictionary containing 'ZX', 'ZXT', 'ZT' tensors
+    model : FCR model
+        The loaded FCR model
+    """
+    # Load model and data
+    args, model= get_model(model_dir, target_epoch=target_epoch, return_dataset=False)
+    
+    # Prepare dataset
+    if data_path is None and adata is None:
+        raise ValueError("Either data_path or adata must be provided")
+    
+    if data_path is not None:
+        print("Preparing dataset from data_path...")
+        adata = sc.read(data_path)
+        datasets = prepare_dataset(args, data_path, "all", max_size=np.inf)
+    else:
+        print("Preparing dataset from provided adata...")
+        datasets = prepare_dataset(args, "all", adata=adata, max_size=np.inf)
+
+    splits = datasets[0]
+
+    # Compute latents
+    # The output can be either a dictionary with ZXs, ZTs, ZXTs or an AnnData object with the latents stored in obsm
+    out = compute_latents(model, 
+                                 splits, 
+                                 adata,
+                                 only_latents=not return_adata, 
+                                 batch_size=args.get('batch_size', 256), 
+                                 max_samples=np.inf)
+
+    return out
 
 def compare_latent_vs_raw_predictions(
     model_dir: str,
@@ -99,7 +147,7 @@ def compare_latent_vs_raw_predictions(
         print(f"Computing latents for {len(adata)} samples...")
     
     # Compute latents (and save them to AnnData)
-    compute_latents(model, datasets, adata)
+    compute_latents(model, datasets, adata, batch_size=256)
         
     # Convert to numpy for sklearn
     ZX_np = adata.obsm["ZXs"]

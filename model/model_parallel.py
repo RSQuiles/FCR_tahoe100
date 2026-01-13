@@ -27,6 +27,8 @@ from ..utils.math_utils import (
 import warnings
 warnings.filterwarnings("ignore")
 
+from sklearn.metrics import r2_score
+
 #####################################################
 #                     LOAD MODEL                    #
 #####################################################
@@ -47,6 +49,7 @@ def load_FCR(args, state_dict=None):
         omega2=args["omega2"], # KL divergence
         omega3=args.get("omega3", 10.0), # Permutation loss
         omega4=args.get("omega4", 10.0), # Similarity loss
+        omega5 = args.get("omega5", 10.0), # R2 loss
         dist_mode=args["dist_mode"],
         dist_outcomes=args["dist_outcomes"],
         patience=args["patience"],
@@ -82,6 +85,7 @@ class FCR(nn.Module):
         omega2=2.0,
         omega3=10.0,
         omega4=10.0,
+        omega5=10.0,
         dist_mode="match",
         dist_outcomes="normal",
         type_treatments=None,
@@ -114,6 +118,7 @@ class FCR(nn.Module):
         # NEW: weight for permutation discriminators and similarity loss
         self.omega3 = omega3
         self.omega4 = omega4
+        self.omega5 = omega5
         self.dist_mode = dist_mode
 
         # Early stopping
@@ -348,7 +353,7 @@ class FCR(nn.Module):
             outcomes = self.outcomes_embeddings(outcomes)
         
         if self.embed_treatments:
-            treatments = self.treatments_embeddings(treatments)    
+            treatments = self.treatments_embeddings(treatments) 
             
         if self.embed_covariates:
             covariates = [emb(covars) for covars, emb in 
@@ -765,7 +770,8 @@ class FCR(nn.Module):
         #cf_treatments, ## modified: cf_treatments are not used in the function
         covariates,
         eval = False,
-        return_dist=False
+        return_dist=False,
+        control = False ## modified: defines which decoder to use
     ):
         outcomes, treatments, covariates = self.move_inputs(
             outcomes, treatments, covariates
@@ -792,7 +798,10 @@ class FCR(nn.Module):
             latents_dist_mean = torch.cat([ZX_dist.mean, ZXT_dist.mean, ZT_dist.mean], dim = 1)
             latents_dist_stddev = torch.cat([ZX_dist.stddev, ZXT_dist.stddev, ZT_dist.stddev], dim = 1)
             #latents_dist = self.distributionize(torch.stack([latents_dist_mean, latents_dist_stddev], dim=-1))
-            outcomes_constr = self.sample_expr(latents_dist_mean, latents_dist_stddev, eval=eval)
+            if not control:
+                outcomes_constr = self.sample_expr(latents_dist_mean, latents_dist_stddev, eval=eval)
+            else:
+                outcomes_constr = self.sample_control(latents_dist_mean, latents_dist_stddev)
             outcomes_dist = self.distributionize(outcomes_constr)
  
 
@@ -961,8 +970,8 @@ class FCR(nn.Module):
     def loss_paired(self, control_outcomes, control_outcomes_dist_samp,
             expr_outcomes, expr_outcomes_dist_samp, exp_dist, ZX_dist, ZT_dist, ZXT_dist,
             ZX_prior_dist, ZT_prior_dist, ZXT_prior_dist, control_prior_dist,control_latents_dist,
-            cov_constr, treatment_constr, treatments,
-            covariates, kde_kernel_std=1.0):
+            cov_constr, treatment_constr, treatments, covariates, 
+            kde_kernel_std=1.0, single_treatment=False):
         """
         Compute losses.
         """
@@ -1014,7 +1023,10 @@ class FCR(nn.Module):
             cov_loss = cov_loss + cross_entropy_loss(cov_constr[...,i],covariates[i].squeeze())
 
         # 4) Reconstruction loss of treatments from (ZTs, ZTs_control)
-        treatment_loss = cross_entropy_loss(treatment_constr.squeeze(),torch.argmax(treatments, 1))
+        if not single_treatment:
+            treatment_loss = cross_entropy_loss(treatment_constr.squeeze(),torch.argmax(treatments, 1))
+        else:
+            treatment_loss = torch.tensor(0.0, device=self.device) # placeholder if only one treatment (no treatment reconstruction loss)
 
         # KL divergences:
 
@@ -1103,6 +1115,7 @@ class FCR(nn.Module):
 
     def forward(self, outcomes, treatments, control_outcomes, covariates,
                 adv_training=False, sample_latent=True, detach_encode=False, detach_eval=True,
+                single_treatment=False # Eliminates treatment reconstruction loss if only one treatment (e.g., control) is used
                 ):
         """
         Execute the workflow.
@@ -1285,12 +1298,60 @@ class FCR(nn.Module):
         kl_divergence_ind, kl_divergence_X, kl_divergence_T, kl_divergence_XT,kl_divergence_control, conditions, conditions_labels = \
         self.loss_paired(control_outcomes, control_outcomes_dist, outcomes, expr_outcomes_dist, exp_dist,
                         ZX_constr, ZT_constr, ZXT_constr, ZX_prior_dist, ZT_prior_dist,ZXT_prior_dist, control_prior_dist, control_latents_dist,
-                        cov_constr, treatment_constr, treatments,covariates)
+                        cov_constr, treatment_constr, treatments,covariates, 
+                        single_treatment=single_treatment)
 
                 
         permute_T_loss = self.loss_discriminator_T(permute_T_pred, perturb_T[:, -1]) 
         permute_X_loss = self.loss_discriminator_X(permute_X_pred, perturb_X[:, -1])
         permute_loss =  0.5 * (permute_T_loss + permute_X_loss)
+
+        # ADDED explicit R2 loss (average gene expression for each cov_pert category)
+        cov_names = torch.cat(covariates, -1)
+        mean_score = []
+
+        for cov_value in torch.unique(cov_names, dim=0):
+            for treat_value in torch.unique(treatments, dim=0):
+                cov_mask = (cov_names == cov_value).all(dim=1)
+                treat_mask = (treatments == treat_value).all(dim=1)
+                idx = torch.where(cov_mask & treat_mask)[0]
+                if len(idx) < 2:
+                    # print("Warning: condition with less than 2 samples found during R2 computation.")
+                    if len(idx) == 0:
+                        continue
+                # print("Condition with more than 2 samples!")
+                expr_yp = expr_outcomes_dist.mean[idx].detach().cpu()
+                expr_yp_m = expr_yp.mean(0)
+                if torch.any(torch.isnan(expr_yp_m)):
+                    print("NaN detected in predicted mean")
+
+                expr_yt = outcomes[idx].detach().cpu()
+                expr_yt_m = expr_yt.mean(0)
+                if torch.any(torch.isnan(expr_yt_m)):
+                    print("NaN detected in true mean")
+
+                r2_expr = r2_score(expr_yt_m, expr_yp_m)
+
+                # Take into account also the associated control sample
+                """
+                control_yp = control_outcomes_dist.mean[idx].detach().cpu()
+                control_yp_m = control_yp.mean(0)
+                if torch.any(torch.isnan(control_yp_m)):
+                    print("NaN detected in predicted mean for control")
+
+                control_yt = control_outcomes[idx].detach().cpu()
+                control_yt_m = control_yt.mean(0)
+                if torch.any(torch.isnan(control_yt_m)):
+                    print("NaN detected in true mean for control")
+
+                r2_control = r2_score(control_yt_m, control_yp_m)
+                """
+
+                # r2_avg = (r2_expr + r2_control)/2
+                r2_avg = r2_expr
+                mean_score.append(r2_avg)
+        
+        r2_loss = torch.tensor(np.mean(mean_score), dtype=torch.float64, device=self.device)
 
         # ORGANIZE LOSS AND LOGGING METRICS
 
@@ -1306,6 +1367,7 @@ class FCR(nn.Module):
             + self.omega2 * (kl_divergence_samples + kl_divergence_factored)
             -  self.omega3 * permute_loss   
             +  self.omega4 * sim_loss
+            -  self.omega5 * r2_loss
         )
 
         metrics = {
@@ -1319,7 +1381,8 @@ class FCR(nn.Module):
             "KL Divergence": kl_divergence.item(),
             "Discriminator": permute_loss.item(),
             "Permute_T Loss": permute_T_loss.item(),
-            "Permute_X Loss": permute_X_loss.item()
+            "Permute_X Loss": permute_X_loss.item(),
+            "R2 Loss": r2_loss.item(),
             } 
 
         if not adv_training:
@@ -1577,26 +1640,26 @@ class FCR(nn.Module):
 
     def init_decoder_interv(self):
         return MLP([1]
-            + [self.num_treatments],
+            + [self.treatment_dim],
             heads=1, final_act= "softmax"
         )
     
     def init_decoder_interv_element(self):
         return MLP([self.hparams["ZT_dim"] +self.hparams["ZXT_dim"]]
-            + [self.num_treatments],
+            + [self.treatment_dim],
             heads=1, final_act= "softmax"
         )
     
     def init_decoder_interv_concat(self):
         return MLP([(self.hparams["ZT_dim"] + self.hparams["ZXT_dim"])*2]
-            + [self.num_treatments],
+            + [self.treatment_dim],
             heads=1, final_act= "softmax"
         )
     
     
     def init_decoder_interv_single(self):
         return MLP([(self.hparams["ZT_dim"] + self.hparams["ZXT_dim"])*2]
-            + [self.num_treatments],
+            + [self.treatment_dim],
             heads=1, final_act= "softmax"
         )
     

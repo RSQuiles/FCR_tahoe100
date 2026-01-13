@@ -1,10 +1,8 @@
 import numpy as np
-
 from sklearn.metrics import r2_score
-
 import torch
-
 from ..utils.general_utils import unique_ind
+import re
 
 def evaluate(model, datasets, batch_size=None):
     """
@@ -209,6 +207,7 @@ def evaluate_r2_classic(model, dataset, dataset_control, batch_size=None, min_sa
 
 # ADDED: eval flag enables the usage of the "eval" model, so that the original model is not used (crucial for DDP implementation)
 def evaluate_prediction(model, datasets, args, eval=False):
+    print("Evaluating model...")
     """
     `evaluate` used in CPA
     https://github.com/facebookresearch/CPA
@@ -233,6 +232,7 @@ def evaluate_prediction(model, datasets, args, eval=False):
     return evaluation_stats
 
 ## Modified: eliminated batch_size argument
+## Note: this takes into account the average gene expression (for each gene) over all cells in the batch
 def evaluate_prediction_r2(model, dataset, args, min_samples=30, eval=False):
     """
     `evaluate_r2` used in CPA
@@ -242,6 +242,7 @@ def evaluate_prediction_r2(model, dataset, args, min_samples=30, eval=False):
     mean_score, mean_score_de = [], []
 
     for pert_category in np.unique(dataset.dataset.cov_pert):
+        # print(f"Perturbation category: {pert_category}")
         idx = np.where(dataset.dataset.cov_pert == pert_category)[0]
         # Subset the indices
         if len(idx) > args["batch_size"]:
@@ -254,12 +255,23 @@ def evaluate_prediction_r2(model, dataset, args, min_samples=30, eval=False):
             covars = [covar[idx] for covar in dataset.dataset.covariates]
             genes = dataset.dataset.genes[idx]
             num_eval = 0
-            yp = [] 
+            yp = []
+            # Determine if control (different decoder)
+            match = re.search(r"(DMSO_TF)", pert_category)
+            if match:
+                # print("Control detected for this perturbation category")
+                # control = True
+                # Always use experiment decoder
+                control = False
+            else:
+                control = False
+
             out = model.predict_self(
                     genes,
                     perts,
                     [covar for covar in covars],
-                    eval = eval
+                    eval = eval,
+                    control = control
                 )
             
             yp = out.detach().cpu()

@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Optional
 import scipy
 import numpy as np
 import scanpy as sc
@@ -23,9 +23,10 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 class Dataset:
     def __init__(
         self,
-        data,
+        data_path,
         args,
-        perturbation_key="perturbation",
+        adata=None,
+        perturbation_key="drug",
         control_key="control",
         dose_key="dose",
         covariate_keys="covariates",
@@ -45,9 +46,16 @@ class Dataset:
         start = time.time()
 
         # Load AnnData
-        data_path = Path(data) 
-        # print("Reading AnnData...")
-        self.adata = sc.read(data_path)
+        if data_path is not None:
+            print("Importing data from: ", data_path)
+            data_path = Path(data_path) 
+            # print("Reading AnnData...")
+            self.adata = sc.read(data_path)
+        elif adata is not None:
+            self.adata = adata
+        else:
+            raise ValueError("Either data_path or adata must be provided to load the dataset.")
+        
         if max_size is not None and self.adata.n_obs > max_size:
             print(f"Subsampling dataset from {self.adata.n_obs} to {max_size} samples for faster loading...")
             print("Choosing random indices...")
@@ -69,6 +77,9 @@ class Dataset:
 
         # Fields
         # perturbation
+        if perturbation_key not in self.adata.obs.columns:
+            print(f"Perturbation {perturbation_key} is missing in the provided adata, falling back to 'drug'.")
+            perturbation_key = "drug"
         assert perturbation_key in self.adata.obs.columns, f"Perturbation {perturbation_key} is missing in the provided adata"
 
         # control
@@ -80,15 +91,13 @@ class Dataset:
                 raise ValueError(f"Control {control_key} is missing in the provided adata and no control_name was given.")
         
         # dose
-        if dose_key is None:
-            print("Adding a dummy dose...")
-            self.adata.obs["dummy_dose"] = 1.0
-            dose_key = "dummy_dose"
-        elif dose_key not in self.adata.obs.columns:
+        if dose_key is None or dose_key not in self.adata.obs.columns:
             if embedded_dose is not None:
                 self.adata.obs[dose_key] = self.adata.obs[embedded_dose].str.split(",").str[1].astype(float)
             else:
-                raise ValueError(f"Dose {dose_key} is missing in the provided adata and no embedded_dose column was given.")
+                print("Adding a dummy dose...")
+                self.adata.obs["dummy_dose"] = 1.0
+                dose_key = "dummy_dose"
 
         # covariates
         if covariate_keys is None or len(covariate_keys)==0:
@@ -103,7 +112,7 @@ class Dataset:
 
         # split
         if split_key is None or split_key not in self.adata.obs.columns:
-            # print(f"Performing automatic train-test split with {test_ratio} ratio.")
+            print(f"Performing automatic train-test split with {test_ratio} ratio.")
             from sklearn.model_selection import train_test_split
 
             self.adata.obs["split"] = "train"
@@ -152,7 +161,7 @@ class Dataset:
 
         # PERTURBATIONS
         print("Loading Perturbations...")
-        pert_unique = np.array(self.get_unique_perts(self.adata, perturbation_key))
+        pert_unique = np.array(self.get_unique_perts())
 
         if self.perturbation_input == "ohe":
             # Using custom OHE for perturbations
@@ -176,20 +185,26 @@ class Dataset:
         elif self.perturbation_input == "chemberta":
             print("Using ChemBERTa embeddings for perturbations!")
             drug_df = pd.read_parquet(drug_metadata_path)
-            self.perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "chemberta"].values[0])
+            perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "chemberta"].values[0])
                                         for pert in self.pert_names])
+            # Multiply by dose to generate unique embeddings for each drug-dosage combination
+            self.perturbations = perturbations * torch.tensor(self.doses, dtype=torch.float32).unsqueeze(1)
             
         elif self.perturbation_input == "morgan":
             print("Using Morgan fingerprints for perturbations!")
             drug_df = pd.read_parquet(drug_metadata_path)
-            self.perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "morgan_fp"].values[0])
+            perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "morgan_fp"].values[0])
                                         for pert in self.pert_names])
-            
+            # Multiply by dose to generate unique embeddings for each drug-dosage combination
+            self.perturbations = perturbations * torch.tensor(self.doses, dtype=torch.float32).unsqueeze(1)
+
         elif self.perturbation_input == "maccs":
             print("Using MACCS keys for perturbations!")
             drug_df = pd.read_parquet(drug_metadata_path)
-            self.perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "maccs_fp"].values[0])
+            perturbations = torch.stack([torch.tensor(drug_df.loc[drug_df["drug"] == pert, "maccs_fp"].values[0])
                                         for pert in self.pert_names])
+            # Multiply by dose to generate unique embeddings for each drug-dosage combination
+            self.perturbations = perturbations * torch.tensor(self.doses, dtype=torch.float32).unsqueeze(1)
             
         else:
             raise NotImplementedError("Unmatched input mode for treatments")
@@ -244,7 +259,7 @@ class Dataset:
         self.cov_control = self.cov_names + "_" + self.controls
         self.cov_control_idx = unique_ind(self.cov_control)
 
-        self.num_treatments = args["num_treatments"]
+        self.num_treatments = self.perturbations.shape[1]
         self.num_outcomes = self.adata.n_vars
 
         # Counterfactual gene indices
@@ -273,8 +288,8 @@ class Dataset:
         idx = list(set(self.indices[split]) & set(self.indices[condition]))
         return SubDataset(self, idx)
     
-    def get_unique_perts(self, adata, perturbation_key="perturbation"):
-        all_perts = adata.obs[perturbation_key].values
+    def get_unique_perts(self):
+        all_perts = self.adata.obs[self.perturbation_key].values
         perts = [i for p in all_perts for i in p.split("+")]
         return list(dict.fromkeys(perts))
 
@@ -355,8 +370,9 @@ def load_dataset_splits(
     
     
 def load_dataset_train_test(
-    data_path: str,
+    data_path: Optional[str],
     args: dict,
+    adata=None,
     perturbation_key: str = "Agg_Treatment",
     perturbation_input: str = "ohe",
     control_key: str = "control",
@@ -370,10 +386,19 @@ def load_dataset_train_test(
     max_size: int = None,
 ):
 
-    dataset = Dataset(
-        data_path, args, perturbation_key, control_key, dose_key, covariate_keys, split_key, 
-        sample_cf=sample_cf, control_name=control_name, embedded_dose=embedded_dose,
-        perturbation_input=perturbation_input, max_size = max_size
+    dataset = Dataset(data_path, 
+                      args,
+                      adata=adata,
+                      perturbation_key=perturbation_key, 
+                      control_key=control_key, 
+                      dose_key=dose_key, 
+                      covariate_keys=covariate_keys, 
+                      split_key=split_key,
+                      sample_cf=sample_cf, 
+                      control_name=control_name, 
+                      embedded_dose=embedded_dose,
+                      perturbation_input=perturbation_input, 
+                      max_size = max_size
     )
 
     splits = {
@@ -390,10 +415,19 @@ def load_dataset_train_test(
         return splits
 
 
-def prepare_dataset(args, data_path, split_name, state_dict=None, max_size = 500_000):
+def prepare_dataset(args, 
+                    split_name,
+                    data_path=None,
+                    adata=None,
+                    state_dict=None, 
+                    max_size = 500_000):
     """
     Instantiates dataset
     """
+
+    # Dataset must be prepared from a path or an AnnData object
+    if data_path is None and adata is None:
+        raise ValueError("Either data_path or adata must be provided to prepare the dataset.")
     
     # dataset
     if args['covariate_keys']!= None:
@@ -416,7 +450,8 @@ def prepare_dataset(args, data_path, split_name, state_dict=None, max_size = 500
     datasets = load_dataset_train_test(
     data_path,
     args,
-    max_size = max_size,
+    max_size=max_size,
+    adata=adata,
     perturbation_input = args.get("perturbation_input", "ohe"),
     covariate_keys = covariate_keys,
     perturbation_key = perturbation_key,

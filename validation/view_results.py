@@ -11,9 +11,15 @@ import argparse
 import scanpy as sc
 import re
 import math
-import matplotlib.colors as mcolors
 
-def compute_latents(trained_model, datasets, adata, batch_size, sample=False, max_samples=100_000):
+from ..fcr import get_model
+import matplotlib.colors as mcolors
+import seaborn as sns
+from glasbey import create_palette
+
+from ..dataset.dataset import prepare_dataset
+
+def compute_latents(trained_model, datasets, adata, batch_size, sample=False, max_samples=50_000, only_latents=False):
     print("Computing latent representations...")
     indices = []
     ZXs = []
@@ -45,6 +51,13 @@ def compute_latents(trained_model, datasets, adata, batch_size, sample=False, ma
     ZTs = [e.detach().cpu().numpy() for e in ZTs]
     ZTs = np.array(ZTs)
     # print("ZT mean:", ZTs.mean(), "ZT std:", ZTs.std())
+
+    if only_latents:
+        latent_dic = {
+            "ZX": ZXs,
+            "ZT": ZTs,
+            "ZXT": ZXTs}
+        return latent_dic
 
     # Subset AnnData according to indices
     subset_obs = adata.obs.iloc[indices]
@@ -185,10 +198,15 @@ def filter_adata(adata, filter_dict):
 
 def plot_umaps(model_dir, 
                n_checkpoint=None, 
-               plot_raw=True, 
+               plot_raw=False,
+               plot_all=False,
+               plot_zx=False,
+               plot_zxt=False,
+               plot_zt=False, 
                target_epoch=None, 
-               drug_dict=None, 
-               cell_dict=None, 
+               # drug_dict=None, 
+               # cell_dict=None,
+               filter_dict=None, 
                all_drugs=False, 
                sample=False, 
                show_figs=False):
@@ -210,7 +228,10 @@ def plot_umaps(model_dir,
             {'Agg_Treatment': ['Trametinib', 'Dabrafenib']}  # Multiple drugs
             {'cell_name': 'A375', 'dose': 10}  # Multiple conditions
     """
-    from ..fcr import get_model
+
+    # Define plotting mode
+    if not plot_zx and not plot_zxt and not plot_zt:
+        plot_all = True
 
     args, model, datasets= get_model(model_dir, target_epoch)
     splits = datasets[0]
@@ -231,10 +252,14 @@ def plot_umaps(model_dir,
     except:
         pass
 
-    # Compute subset AnnData with latents
-    adata = compute_latents(model, splits, adata, batch_size, sample=sample)
+    if filter_dict is None:
+        adata = compute_latents(model, splits, adata, batch_size, sample=sample)
+    # If we are filtering, do not cap the amount of samples
+    else:
+        adata = compute_latents(model, splits, adata, batch_size, sample=sample, max_samples=np.inf)
 
     # Apply filters if provided
+    """
     if drug_dict is not None:
         adata_drug, drug_suffix = filter_adata(adata, drug_dict)
     else:
@@ -246,69 +271,94 @@ def plot_umaps(model_dir,
     else:
         cell_suffix = ""
         adata_cell = adata
+    """
+    if filter_dict is not None:
+        adata_sub, filter_suffix = filter_adata(adata, filter_dict)
+        # The following does not work for perturbation_input="ohe", because the size of
+        # the treatment embeddings depends on the treatments present in the dataset 
+        #new_datasets = prepare_dataset(
+        #    args,
+        #    data_path=None,
+        #    split_name="all",
+        #    adata=adata_sub
+        #)
+        #new_splits = new_datasets[0]
+    else:
+        adata_sub = adata
+        #new_splits = splits
+        filter_suffix = ""
+
+    # Generate palette
+    n = adata.obs["cell_name"].nunique()
+    palette = create_palette(palette_size=n)
 
     # Plot ZX
-    print("Plotting ZX UMAP...")
-    fig = umap(adata_cell, rep="ZXs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
-    if show_figs:
-        plt.show()
-    else:
-        fig.savefig(os.path.join(output_dir,f"UMAP_ZXs{cell_suffix}.png"), dpi=300, bbox_inches="tight")
-    plt.close()
-
-    # Plot ZXT
-    print("Plotting ZXT UMAP...")
-    fig = umap(adata_cell, rep="ZXTs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
-    if show_figs:
-        plt.show()
-    else:
-        fig.savefig(os.path.join(output_dir,f"UMAP_ZXTs{cell_suffix}.png"), dpi=300, bbox_inches="tight")
-    plt.close()
-
-    if not all_drugs:
-        # Plot ZT
-        print("Plotting ZT UMAP...")
-        fig = umap(adata_drug, rep="ZTs", color=["dose", "Agg_Treatment", "cell_name"], return_fig=True)
+    if plot_all or plot_zx:
+        print("Plotting ZX UMAP...")
+        fig = umap(adata_sub, rep="ZXs", color=["cell_name", "Agg_Treatment", "dose"], palette=palette, return_fig=True)
         if show_figs:
             plt.show()
         else:
-            fig.savefig(os.path.join(output_dir,f"UMAP_ZTs{drug_suffix}.png"), dpi=300, bbox_inches="tight")
+            fig.savefig(os.path.join(output_dir,f"UMAP_ZXs{filter_suffix}.png"), dpi=300, bbox_inches="tight")
         plt.close()
-        
-    # Option: print ZT against all drugs
-    else:
-        drugs_plot = [drug for drug in adata.obs["Agg_Treatment"].unique() if drug != "DMSO_TF"]
-        for drug in drugs_plot:
-            print(f"Plotting ZT UMAP for drug: {drug}...")
-            filter_dict = {"Agg_Treatment": [drug, "DMSO_TF"]}
-            adata_sub, filter_suffix = filter_adata(adata, filter_dict)
+
+    # Plot ZXT
+    if plot_all or plot_zxt:
+        print("Plotting ZXT UMAP...")
+        fig = umap(adata_sub, rep="ZXTs", color=["cell_name", "Agg_Treatment", "dose"], return_fig=True)
+        if show_figs:
+            plt.show()
+        else:
+            fig.savefig(os.path.join(output_dir,f"UMAP_ZXTs{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+        plt.close()
+
+    # Plot ZT
+    if plot_all or plot_zt:
+        if not all_drugs:
+            print("Plotting ZT UMAP...")
             fig = umap(adata_sub, rep="ZTs", color=["dose", "Agg_Treatment", "cell_name"], return_fig=True)
             if show_figs:
                 plt.show()
             else:
-                fig.savefig(os.path.join(output_dir,f"UMAP_ZTs_{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+                fig.savefig(os.path.join(output_dir,f"UMAP_ZTs{filter_suffix}.png"), dpi=300, bbox_inches="tight")
             plt.close()
+            
+        # Option: print ZT against all drugs
+        else:
+            drugs_plot = [drug for drug in adata.obs["Agg_Treatment"].unique() if drug != "DMSO_TF"]
+            for drug in drugs_plot:
+                print(f"Plotting ZT UMAP for drug: {drug}...")
+                filter_dict = {"Agg_Treatment": [drug, "DMSO_TF"]}
+                adata_sub, filter_suffix = filter_adata(adata, filter_dict)
+                fig = umap(adata_sub, rep="ZTs", color=["dose", "Agg_Treatment", "cell_name"], return_fig=True)
+                if show_figs:
+                    plt.show()
+                else:
+                    fig.savefig(os.path.join(output_dir,f"UMAP_ZTs_{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+                plt.close()
 
     # Plot before FCR
     if plot_raw:
         print("Plotting raw UMAPs...")
-        fig = raw_umap(adata, feature="cell_name")
+        fig = raw_umap(adata_sub, feature="cell_name")
         if show_figs:
             plt.show()
         else:
-            fig.savefig(os.path.join(output_dir,f"UMAP_cell_name.png"), dpi=300, bbox_inches="tight")
+            fig.savefig(os.path.join(output_dir,f"UMAP_cell_name{filter_suffix}.png"), dpi=300, bbox_inches="tight")
 
-        fig = raw_umap(adata, feature="Agg_Treatment")
+        fig = raw_umap(adata_sub, feature="Agg_Treatment")
         if show_figs:
             plt.show()
         else:
-            fig.savefig(os.path.join(output_dir,"UMAP_treatment.png"), dpi=300, bbox_inches="tight")
+            fig.savefig(os.path.join(output_dir,f"UMAP_treatment{filter_suffix}.png"), dpi=300, bbox_inches="tight")
 
-        fig = raw_umap(adata_drug, feature="dose")
+        fig = raw_umap(adata_sub, feature="dose")
         if show_figs:
             plt.show()
         else:
-            fig.savefig(os.path.join(output_dir,f"UMAP_dose{drug_suffix}.png"), dpi=300, bbox_inches="tight")
+            fig.savefig(os.path.join(output_dir,f"UMAP_dose{filter_suffix}.png"), dpi=300, bbox_inches="tight")
+        plt.close()
+
 
 def plot_progression(model_dir, rep, feature, sample=False, last_epoch=None, freq=50, n_cols=5):
     from ..fcr import fetch_latest

@@ -117,6 +117,7 @@ def train(args, prepare=prepare, state_dict=None):
         args["data_path"],
         covariate_keys = args["covariate_keys"],
         perturbation_key = args["perturbation_key"],
+        perturbation_input = args["perturbation_input"],
         control_key= args["control_key"]
     )
     features["control_names"] = control_names
@@ -127,6 +128,7 @@ def train(args, prepare=prepare, state_dict=None):
 
     # Load Model
     args["num_outcomes"] = num_outcomes
+    # print(f"Num_treatments: {num_treatments}")
     args["num_treatments"] = num_treatments
     args["num_covariates"] = num_covariates
 
@@ -146,7 +148,7 @@ def train(args, prepare=prepare, state_dict=None):
     scheduler_autoencoder = torch.optim.lr_scheduler.StepLR(
         optimizer_autoencoder, 
         step_size=args["hparams"]["step_size_lr"],
-        gamma=1
+        gamma=0.1
     )
 
     optimizer_discriminator = optim.Adam(ddp_model.module.params_discriminator,
@@ -156,7 +158,7 @@ def train(args, prepare=prepare, state_dict=None):
     scheduler_discriminator = torch.optim.lr_scheduler.StepLR(
         optimizer_discriminator,
         step_size=args["hparams"]["step_size_lr"],
-        gamma=1
+        gamma=0.1
     )
 
     """
@@ -262,7 +264,8 @@ def train(args, prepare=prepare, state_dict=None):
                 loader.sampler.set_epoch(epoch)
                 
                 # Set adversarial training flag
-                if (epoch % args["adv_epoch"]) == 0 and epoch > 0:
+                # if (epoch % args["adv_epoch"]) == 0 and epoch > 0:
+                if (shard_id % args["adv_epoch"] == 0) and shard_id > 0:
                     adv_training=True
                 else:
                     adv_training=False
@@ -301,7 +304,8 @@ def train(args, prepare=prepare, state_dict=None):
                     control, 
                     covariates, 
                     adv_training=adv_training, 
-                    sample_latent=args["hparams"]["sample_latent"]
+                    sample_latent=args["hparams"]["sample_latent"],
+                    single_treatment=args.get("single_treatment", False)
                 )
                 
                 # Backward pass and optimization step
@@ -390,7 +394,7 @@ def train(args, prepare=prepare, state_dict=None):
                     for key, val in shard_training_stats.items():
                         writer.add_scalar(key, val, epoch)
 
-                # Step schedulers and check early stopping
+                # Step schedulers once per (checkpoint_freq * step_size_lr) shards and check early stopping
                 model.module.early_stopping(shard_training_stats["KL Divergence"], scheduler_autoencoder, scheduler_discriminator)
                 # TEMPORARILY DISABLED EARLY STOP
                 # stop = stop or model.module.early_stopping(shard_training_stats["KL Divergence"], scheduler_autoencoder, scheduler_discriminator)
@@ -429,7 +433,7 @@ def train(args, prepare=prepare, state_dict=None):
             # UMAP PLOTTING EACH EPOCH
             print(f"Plotting UMAPs for epoch {epoch}!")
             plot_raw = True if epoch == 0 else False
-            plot_umaps(model_dir=args["artifact_path"], n_checkpoint=epoch, plot_raw=plot_raw, all_drugs=False, sample=False)
+            # plot_umaps(model_dir=args["artifact_path"], n_checkpoint=epoch, plot_raw=plot_raw, all_drugs=False, sample=False)
             # plot_progression(model_dir=args["artifact_path"], rep="ZXs", feature="cell_name", freq=100)
             # plot_progression(model_dir=args["artifact_path"], rep="ZTs", feature="dose", freq=100)
 
